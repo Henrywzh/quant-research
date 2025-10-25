@@ -1,5 +1,14 @@
+# Environment
 venv/
 .env
-data/raw/
+
+# IDE configs
+.idea/
+.vscode/
 __pycache__/
 *.pyc
+
+# Data
+data/raw/
+*.csv
+*.xlsx
