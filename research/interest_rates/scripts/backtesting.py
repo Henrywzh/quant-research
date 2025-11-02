@@ -9,6 +9,7 @@ from matplotlib import pyplot as plt
 # Helpers & Metrics
 # =========================
 
+
 @dataclass
 class RegimeConfig:
     # weighting
@@ -24,6 +25,132 @@ class RegimeConfig:
     vol_target_ann: float = None  # e.g., 0.10; None to disable
     vol_lb_m: int = 36
     max_leverage: float = 2.0
+
+
+@dataclass
+class RegimeConfig3(RegimeConfig):
+    # yield-curve slope for flat vs steep (can be "spread_10y_2y" or "PC2_Slope")
+    slope_col: str = "spread_10y_2y"
+    slope_ewma_halflife: int = 3
+    slope_zero: float = 0.0           # threshold for flat/inverted
+
+    # (optional) enforce regime persistence
+    min_duration_m: int = 2           # minimum months to stay in a regime
+
+    # policy weights per regime: (EQ, Bond, Cash), must sum to 1
+    w_expansion: tuple = (0.80, 0.20, 0.00)  # Expansion
+    w_rec_flat: tuple = (0.20, 0.60, 0.20)   # Recession–Flat
+    w_rec_steep: tuple = (0.50, 0.40, 0.10)  # Recession–Steep
+
+    # how probability p maps to (EQ, Bond, Cash) when blending
+    beta_bond: float = 0.7            # of the “p” slice, pct to Bonds (rest to Cash)
+
+
+def _curve_flat_flag(df: pd.DataFrame, cfg: RegimeConfig3) -> pd.Series:
+    s = df[cfg.slope_col].ewm(halflife=cfg.slope_ewma_halflife, adjust=False).mean()
+    return (s < cfg.slope_zero).astype(int).rename("curve_flat")  # 1 = flat/inverted
+
+def _enforce_min_duration(series: pd.Series, min_m: int) -> pd.Series:
+    """Force regimes to last at least min_m months."""
+    if min_m <= 1:
+        return series
+    s = series.copy().astype(int)
+    start = 0
+    for i in range(1, len(s)):
+        if s.iloc[i] != s.iloc[i-1]:
+            # check length of previous block
+            if (i - start) < min_m:
+                s.iloc[i] = s.iloc[i-1]  # cancel flip
+            else:
+                start = i
+    return s
+
+def build_regime3_labels(df: pd.DataFrame, cfg: RegimeConfig3):
+    # macro risk (0=expansion, 1=recession) using your hysteresis on smoothed prob
+    p = df["p_recession"].clip(0, 1)
+    p_sm = ewma(p, halflife=cfg.p_ewma_halflife)
+    macro = hysteresis_state(p_sm, up=cfg.up, down=cfg.down, confirm=cfg.confirm)  # 0/1
+
+    # curve flat/inverted (1) vs steep (0)
+    flat = _curve_flat_flag(df, cfg)  # 0/1
+
+    # map to 3 regimes: 0=Expansion, 1=Recession-Flat, 2=Recession-Steep
+    r3 = []
+    for m, f in zip(macro.values, flat.values):
+        if m == 0:       # expansion
+            r3.append(0) # Expansion
+        else:
+            r3.append(1 if f == 1 else 2)  # Rec-Flat or Rec-Steep
+    r3 = pd.Series(r3, index=df.index, name="regime3")
+
+    # optional persistence
+    r3 = _enforce_min_duration(r3, cfg.min_duration_m)
+
+    return p_sm.rename("p_smooth"), macro.rename("macro_state"), flat, r3
+
+
+def build_weights_3reg(df: pd.DataFrame, cfg: RegimeConfig3):
+    p_sm, macro, flat, regime3 = build_regime3_labels(df, cfg)
+
+    # regime policy vectors
+    reg_map = {
+        0: np.array(cfg.w_expansion),
+        1: np.array(cfg.w_rec_flat),
+        2: np.array(cfg.w_rec_steep),
+    }
+    W_reg = np.vstack([reg_map[r] for r in regime3.values])  # shape (T, 3)
+
+    # probability vector (continuous)
+    W_prob = np.column_stack([
+        1 - p_sm.values,                   # EQ
+        cfg.beta_bond * p_sm.values,       # Bond
+        (1 - cfg.beta_bond) * p_sm.values  # Cash
+    ])
+
+    # convex blend
+    lam = cfg.lambda_prob
+    W = lam * W_prob + (1 - lam) * W_reg
+    W = np.clip(W, 0, 1)
+
+    # optional cash filter: divert Bond->Cash if (Rec-Flat) & bond momentum < 0
+    if cfg.use_cash_filter:
+        mom = bond_momentum_signal(df["ret_bond"], lookback_m=cfg.mom_lookback_m)
+        mask = (regime3 == 1) & (mom < 0)  # only Recession–Flat & bad bond mom
+        idx = np.where(mask.values)[0]
+        # move ALL bond weight to cash on those months (simple & conservative)
+        W[idx, 2] += W[idx, 1]
+        W[idx, 1]  = 0.0
+
+    # light smoothing for turnover control
+    W_df = pd.DataFrame(W, index=df.index, columns=["w_eq", "w_bond", "w_cash"]).ewm(halflife=2, adjust=False).mean()
+
+    # renormalize to 1 (numerical safety)
+    s = W_df.sum(axis=1).replace(0, np.nan)
+    W_df = (W_df.T / s).T.clip(lower=0)
+    return W_df, regime3, p_sm
+
+
+def build_portfolio_returns_3reg(df: pd.DataFrame, cfg: RegimeConfig3) -> Dict[str, pd.Series]:
+    W, regime3, p_sm = build_weights_3reg(df, cfg)
+    ret_eq, ret_bd = df["ret_eq"], df["ret_bond"]
+    ret_cash = df.get("ret_cash", pd.Series(0.0, index=df.index))
+
+    r_port_raw = (W["w_eq"]*ret_eq) + (W["w_bond"]*ret_bd) + (W["w_cash"]*ret_cash)
+
+    # optional vol targeting (your helper)
+    scaler = vol_target_scaler(r_port_raw, cfg.vol_target_ann, cfg.vol_lb_m, cfg.max_leverage)
+    r_port = scaler.shift(1).fillna(1.0) * r_port_raw
+
+    out = {
+        "r_port": r_port,
+        "r_raw": r_port_raw,
+        "w_eq": W["w_eq"],
+        "w_bond": W["w_bond"],
+        "w_cash": W["w_cash"],
+        "regime3": regime3,
+        "p_smooth": p_sm,
+    }
+    return out
 
 
 def annualized_sharpe(r: pd.Series) -> float:
