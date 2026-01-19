@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Literal
 import numpy as np
 import pandas as pd
@@ -12,46 +13,81 @@ from qresearch.backtest.metrics import (
     drawdown_series_from_equity,
     yearly_returns,
 )
+from qresearch.data.types import MarketData
 
 EntryMode = Literal["next_close", "next_open", "open_to_close"]
 
 
+@dataclass(frozen=True)
+class UniverseFilterConfig:
+    """
+    Universe filter based on rolling MA price floor.
+
+    Example:
+      - window=21
+      - min_ma_price=1.0  (exclude penny-ish HK stocks)
+    """
+    ma_window: int = 21
+    min_ma_price: float = 1.0
+
+
+def compute_ma_price_eligibility(
+    close: pd.DataFrame,
+    cfg: UniverseFilterConfig,
+) -> pd.DataFrame:
+    """
+    Returns a boolean DataFrame (date x ticker):
+      eligible[t, i] = True if MA_window(close)[t, i] >= min_ma_price
+
+    No lookahead:
+    - MA at date t uses close up to t (inclusive).
+    """
+    ma = close.rolling(cfg.ma_window, min_periods=cfg.ma_window).mean()
+    eligible = ma >= cfg.min_ma_price
+    return eligible
+
+
 def bucket_backtest(
-    price_df: pd.DataFrame,
+    md: MarketData,
     signal: pd.DataFrame,
     H: int = 1,
     n_buckets: int = 10,
     entry_mode: EntryMode = "next_close",
+    universe_eligible: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    price_df : yfinance-style MultiIndex columns with ['Open','Close',...] on level 0
-    signal   : DataFrame (dates x tickers), computed at close[t]
-    H        : holding horizon (trading days)
-    Rebalance: every H days, non-overlapping
+    Cross-sectional bucket backtest (non-overlapping holding periods).
 
-    Returns
-    -------
-    bucket_ret : DataFrame indexed by rebalance dates
-    bucket_lbl : DataFrame indexed by ALL dates (ffill for convenience)
-    ret_fwd    : DataFrame indexed by ALL dates, formation-aligned forward return
+    IMPORTANT bucket convention (your choice):
+    bucket_1 = WORST (lowest signal)
+    bucket_n = BEST  (highest signal)
+
+    universe_eligible (optional):
+    - boolean DataFrame (date x ticker)
+    - True means the asset is eligible on formation date t
     """
-    close = price_df["Close"].sort_index()
+    close = md.close.sort_index()
 
+    # Defensive: keep signal universe consistent with price universe.
+    # This prevents "extra tickers" in signal from causing index unions later.
+    signal = signal.reindex(index=close.index, columns=close.columns)
+
+    # Entry/exit prices aligned with "signal computed at close[t]"
+    # ret_fwd[t] = exit(t+H+1)/entry(t+1) - 1
     if entry_mode == "next_close":
         entry_px = close.shift(-1)
         exit_px = close.shift(-(H + 1))
     elif entry_mode == "next_open":
-        open_ = price_df["Open"].sort_index()
+        open_ = md.open.sort_index()
         entry_px = open_.shift(-1)
         exit_px = open_.shift(-(H + 1))
     elif entry_mode == "open_to_close":
-        open_ = price_df["Open"].sort_index()
+        open_ = md.open.sort_index()
         entry_px = open_.shift(-1)
         exit_px = close.shift(-(H + 1))
     else:
         raise ValueError("entry_mode must be one of: next_close, next_open, open_to_close")
 
-    # formation-aligned forward return: ret_fwd[t] = exit(t+H+1) / entry(t+1) - 1
     ret_fwd = exit_px / entry_px - 1
 
     dates = close.index
@@ -65,29 +101,60 @@ def bucket_backtest(
     bucket_ret = {f"bucket_{k}": [] for k in range(1, n_buckets + 1)}
     out_dates = []
 
-    bucket_lbl = pd.DataFrame(index=dates, columns=signal.columns, dtype=float)
+    # Keep labels on the same grid as our price universe (not signal.columns, which might drift).
+    bucket_lbl = pd.DataFrame(index=dates, columns=close.columns, dtype=float)
+
+    # Align eligibility grid (if provided) once (cheap, avoids shape bugs)
+    if universe_eligible is not None:
+        universe_eligible = (
+            universe_eligible.reindex(index=dates, columns=close.columns)
+            .fillna(False)
+            .astype(bool)
+        )
 
     for t in rebalance_dates:
+        # With the reindex above, t is in signal/ret_fwd indexes, but keep the guard anyway.
         if t not in signal.index or t not in ret_fwd.index:
             continue
 
-        sig_t = signal.loc[t]
+        sig_t = signal.loc[t]     # Series indexed by ticker
+        ret_t = ret_fwd.loc[t]    # Series indexed by ticker
 
-        # valid: have a signal AND have a realized forward return
-        valid_mask = sig_t.notna() & ret_fwd.loc[t].notna()
-        valid_tickers = sig_t.index[valid_mask]
+        # --- HARD ALIGNMENT (this is the critical fix) ---
+        # Ensure sig_t, ret_t, and elig_t all share exactly the same ticker index.
+        common = sig_t.index.intersection(ret_t.index)
+        if universe_eligible is not None:
+            common = common.intersection(universe_eligible.columns)
 
-        if len(valid_tickers) == 0 or len(valid_tickers) < n_buckets:
+        # If the available universe is too small, skip.
+        if len(common) < n_buckets:
             continue
 
-        sig_valid = sig_t[valid_tickers]
+        sig_t = sig_t.reindex(common)
+        ret_t = ret_t.reindex(common)
 
-        # tie-breaker for discrete signals
+        # Base validity: have signal AND realized forward return
+        valid_mask = sig_t.notna() & ret_t.notna()
+
+        # Apply universe eligibility on formation date t (e.g., exclude penny stocks)
+        if universe_eligible is not None:
+            elig_t = universe_eligible.loc[t].reindex(common).fillna(False).astype(bool)
+            valid_mask = valid_mask & elig_t
+
+        # IMPORTANT: use Series boolean filtering, not Index boolean indexing
+        valid_tickers = sig_t[valid_mask].index
+
+        if len(valid_tickers) < n_buckets:
+            continue
+
+        sig_valid = sig_t.loc[valid_tickers]
+
+        # tie-breaker for discrete signals (ensures stable bucketing)
         eps = pd.Series(np.arange(len(sig_valid), dtype=float), index=sig_valid.index) * 1e-12
         sig_valid = sig_valid + eps
 
-        # high signal => rank 1
-        ranks = sig_valid.rank(ascending=False, method="average")
+        # bucket_1 = worst => rank ascending
+        ranks = sig_valid.rank(ascending=True, method="average")
 
         n_valid = len(valid_tickers)
         bucket_size = n_valid / n_buckets
@@ -97,7 +164,8 @@ def bucket_backtest(
 
         bucket_lbl.loc[t, valid_tickers] = bucket_ids
 
-        r_fwd_t = ret_fwd.loc[t, valid_tickers]
+        # Use ret_t (already aligned) to avoid reintroducing index mismatch
+        r_fwd_t = ret_t.loc[valid_tickers]
 
         for k in range(1, n_buckets + 1):
             members = bucket_ids.index[bucket_ids == k]
@@ -117,6 +185,10 @@ def _compute_ic_spearman(
     dates: pd.Index,
     min_assets: int,
 ) -> pd.Series:
+    """
+    Spearman IC on each rebalance date.
+    signal[t, :] vs ret_fwd[t, :]
+    """
     signal = signal.reindex(index=ret_fwd.index)
     dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
 
@@ -135,6 +207,11 @@ def _compute_coverage_and_nvalid(
     ret_fwd: pd.DataFrame,
     dates: pd.Index,
 ) -> Tuple[pd.Series, pd.Series]:
+    """
+    Coverage diagnostics on rebalance dates:
+    - fraction of universe that is valid (signal and ret_fwd both available)
+    - count of valid assets
+    """
     dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
     universe_size = signal.shape[1]
 
@@ -156,6 +233,10 @@ def _turnover_proxy_from_labels(
     rebalance_dates: pd.Index,
     bucket_k: int,
 ) -> pd.Series:
+    """
+    Simple turnover proxy for a given bucket:
+    turnover(t) = 1 - overlap(members_t, members_{t-1}) / len(members_t)
+    """
     dts = pd.Index(rebalance_dates).intersection(bucket_lbl.index)
 
     prev_members = None
@@ -175,35 +256,90 @@ def _turnover_proxy_from_labels(
     return pd.Series(vals, index=dts, name=f"turnover_bucket_{bucket_k}")
 
 
+def _as_series(x: pd.Series | pd.DataFrame, *, name: str) -> pd.Series:
+    """
+    Normalize a Series-or-1col-DataFrame into a Series.
+    If x is a multi-column DataFrame, raise with a clear error.
+    """
+    if isinstance(x, pd.Series):
+        return x.rename(name)
+
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] == 1:
+            return x.iloc[:, 0].rename(name)
+
+        # Multi-column benchmark is ambiguous: you must choose one
+        raise ValueError(
+            f"Benchmark resolved to a DataFrame with {x.shape[1]} columns. "
+            f"Please pass a single benchmark Series, or a 1-column DataFrame. "
+            f"Columns preview: {list(x.columns)[:10]}"
+        )
+
+    raise TypeError(f"Expected Series or DataFrame, got {type(x)}")
+
+
 def _compute_benchmark_ret_fwd(
     bench_price: pd.DataFrame | pd.Series,
     H: int,
     entry_mode: EntryMode,
 ) -> pd.Series:
+    # --- pick the price series(s) ---
     if isinstance(bench_price, pd.Series):
-        px = bench_price.sort_index()
-        bench_df = None
+        px_close = bench_price.sort_index()
+        px_open = None
+
     else:
         bench_df = bench_price.sort_index()
-        if entry_mode == "next_open":
-            px = bench_df["Open"]
+
+        # yfinance-style MultiIndex columns: ["Open","Close",...] at level 0
+        if isinstance(bench_df.columns, pd.MultiIndex):
+            if "Close" not in bench_df.columns.get_level_values(0):
+                raise KeyError("Benchmark MultiIndex DataFrame must contain level-0 'Close'.")
+            px_close = bench_df["Close"]
+            px_open = bench_df["Open"] if "Open" in bench_df.columns.get_level_values(0) else None
         else:
-            px = bench_df["Close"]
+            cols = list(bench_df.columns)
+            if "Close" in cols:
+                px_close = bench_df["Close"]
+                px_open = bench_df["Open"] if "Open" in cols else None
+            elif len(cols) == 1:
+                px_close = bench_df.iloc[:, 0]
+                px_open = None
+            else:
+                raise KeyError(
+                    f"Benchmark DataFrame must have 'Close' or be 1-column. Got: {cols[:10]}..."
+                )
 
+    # --- normalize: ensure close/open are Series (not DataFrame) ---
+    px_close = _as_series(px_close, name="bench_close")
+    if px_open is not None:
+        px_open = _as_series(px_open, name="bench_open")
+
+    # --- compute forward return consistent with your backtest convention ---
     if entry_mode == "open_to_close":
-        if bench_df is None:
-            raise ValueError("For entry_mode='open_to_close', benchmark must be a DataFrame with Open/Close.")
-        entry_px = bench_df["Open"].shift(-1)
-        exit_px = bench_df["Close"].shift(-(H + 1))
-        return (exit_px / entry_px - 1).rename("benchmark_ret_fwd")
+        if px_open is None:
+            raise ValueError("entry_mode='open_to_close' requires benchmark Open & Close.")
+        entry_px = px_open.shift(-1)
+        exit_px = px_close.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
 
-    entry_px = px.shift(-1)
-    exit_px = px.shift(-(H + 1))
-    return (exit_px / entry_px - 1).rename("benchmark_ret_fwd")
+    elif entry_mode == "next_open":
+        if px_open is None:
+            raise ValueError("entry_mode='next_open' requires benchmark Open.")
+        entry_px = px_open.shift(-1)
+        exit_px = px_open.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
+
+    else:  # "next_close"
+        entry_px = px_close.shift(-1)
+        exit_px = px_close.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
+
+    return out.rename("benchmark_ret_fwd")
 
 
 def make_tearsheet(
-    price_df: pd.DataFrame,
+    md: MarketData,
     signal: pd.DataFrame,
     H: int = 5,
     n_buckets: int = 20,
@@ -214,26 +350,52 @@ def make_tearsheet(
     benchmark_price: Optional[pd.DataFrame | pd.Series] = None,
     benchmark_name: str = "Benchmark",
 ) -> Dict[str, Any]:
+    """
+    Standard tear sheet for your bucket backtest framework.
+
+    Bucket convention (IMPORTANT):
+    ------------------------------
+    bucket_1 = WORST
+    bucket_n = BEST
+
+    So:
+    - "best bucket" = bucket_{n_buckets}
+    - "worst bucket" = bucket_1
+    - "LS" (factor) = best - worst
+    """
     if rolling_window_obs is None:
+        # number of rebalance observations ~ 1 year
         rolling_window_obs = max(10, int(round(TRADING_DAYS / H)))
 
+    # --- run backtest ---
+    close = md.close
+
+    uf_cfg = UniverseFilterConfig(ma_window=21, min_ma_price=1.0)
+    eligible = compute_ma_price_eligibility(close, uf_cfg)
+
     bucket_ret, bucket_lbl, ret_fwd = bucket_backtest(
-        price_df=price_df,
-        signal=signal,
+        md=md,
+        signal=signal,  # date x ticker, computed at close[t]
         H=H,
         n_buckets=n_buckets,
         entry_mode=entry_mode,
+        universe_eligible=eligible,
     )
 
     rebalance_dates = bucket_ret.index
-    freq = TRADING_DAYS / H
 
+    # Annualisation factor for H-day non-overlapping returns.
+    # Keep float on purpose (avoids accidental rounding).
+    freq_per_year = TRADING_DAYS / H
+
+    # --- diagnostics: coverage & IC ---
     signal_aligned = signal.reindex(index=ret_fwd.index)
     coverage, n_valid = _compute_coverage_and_nvalid(signal_aligned, ret_fwd, rebalance_dates)
 
     ic = _compute_ic_spearman(signal_aligned, ret_fwd, rebalance_dates, min_assets=min_assets_ic)
     ic_roll = ic.rolling(rolling_window_obs).mean()
 
+    # Use the same ddof convention as your metrics module (ddof=0) unless you explicitly want ddof=1.
     ic_std = ic.std(ddof=0)
     ic_stats = {
         "ic_mean": float(ic.mean()),
@@ -243,13 +405,16 @@ def make_tearsheet(
         "n_obs": int(ic.dropna().shape[0]),
     }
 
+    # --- bucket summary table ---
     bucket_summary_rows = []
     for col in bucket_ret.columns:
         r = bucket_ret[col].dropna()
         mu = float(r.mean()) if len(r) else np.nan
         sd = float(r.std(ddof=0)) if len(r) >= 2 else np.nan
         tstat = (mu / (sd / np.sqrt(len(r)))) if (len(r) >= 2 and sd > 0) else np.nan
-        ps = perf_summary(bucket_ret[col], freq=int(freq))
+
+        # perf_summary expects "freq" ~ number of periods per year
+        ps = perf_summary(bucket_ret[col], freq=freq_per_year)
         bucket_summary_rows.append({
             "bucket": col,
             "mean_ret_per_period": mu,
@@ -259,29 +424,52 @@ def make_tearsheet(
         })
     bucket_summary = pd.DataFrame(bucket_summary_rows).set_index("bucket")
 
+    # --- monotonicity sanity check ---
+    # Correlation between bucket number (1..n) and mean return.
+    # Since bucket_1 is worst, a "good" signal tends to have positive monotonicity.
     mean_by_bucket = bucket_summary["mean_ret_per_period"].copy()
     tmp = mean_by_bucket.copy()
     tmp.index = tmp.index.str.replace("bucket_", "", regex=False).astype(int)
-    tmp = tmp.sort_index()
+    tmp = tmp.sort_index()  # 1..n_buckets
     monotonic_spearman = float(pd.Series(tmp.index, index=tmp.index).corr(tmp, method="spearman"))
 
-    turnover_bottom = _turnover_proxy_from_labels(bucket_lbl, rebalance_dates, bucket_k=1)
-    turnover_top = _turnover_proxy_from_labels(bucket_lbl, rebalance_dates, bucket_k=n_buckets)
+    # --- bucket identities under YOUR convention ---
+    WORST_BUCKET = 1
+    BEST_BUCKET = n_buckets
+    worst_col = f"bucket_{WORST_BUCKET}"
+    best_col = f"bucket_{BEST_BUCKET}"
 
-    bench_ret = bench_eq = bench_dd = bench_yearly = None
+    # Turnover proxies for best/worst buckets (naming matches semantics)
+    turnover_worst = _turnover_proxy_from_labels(bucket_lbl, rebalance_dates, bucket_k=WORST_BUCKET)
+    turnover_best = _turnover_proxy_from_labels(bucket_lbl, rebalance_dates, bucket_k=BEST_BUCKET)
+
+    # --- long-short (best - worst): crucial for factor research ---
+    ls_ret = (bucket_ret[best_col] - bucket_ret[worst_col]).rename("LS_best_minus_worst")
+    ls_eq = equity_curve(ls_ret)
+    ls_dd = drawdown_series_from_equity(ls_eq)
+    ls_yearly = yearly_returns(ls_ret).rename(ls_ret.name)
+    ls_perf = perf_summary(ls_ret, freq=freq_per_year)
+
+    # --- benchmark aligned to rebalance grid (optional) ---
+    bench_ret = bench_eq = bench_dd = bench_yearly = bench_perf = None
     if benchmark_price is not None:
         bench_ret_full = _compute_benchmark_ret_fwd(benchmark_price, H=H, entry_mode=entry_mode)
-        bench_ret = bench_ret_full.reindex(rebalance_dates)
+        bench_ret = bench_ret_full.reindex(rebalance_dates).rename(benchmark_name)
+
         bench_eq = equity_curve(bench_ret)
         bench_dd = drawdown_series_from_equity(bench_eq)
         bench_yearly = yearly_returns(bench_ret).rename(benchmark_name)
+        bench_perf = perf_summary(bench_ret, freq=freq_per_year)
 
+    # --- plotting ---
     if plot:
+        # 1) Cumulative IC + rolling IC
         plt.figure()
         ic.cumsum().plot()
         plt.title("Cumulative IC (Spearman)")
         plt.ylabel("Cumulative IC")
         plt.xlabel("Date")
+        plt.tight_layout()
         plt.show()
 
         plt.figure()
@@ -289,18 +477,21 @@ def make_tearsheet(
         plt.title(f"Rolling Mean IC (window={rolling_window_obs} obs)")
         plt.ylabel("Rolling IC mean")
         plt.xlabel("Date")
+        plt.tight_layout()
         plt.show()
 
+        # 2) Bucket mean returns bar chart
         plt.figure(figsize=(10, 6))
         mean_by_bucket.sort_index(
             key=lambda idx: idx.str.replace("bucket_", "", regex=False).astype(int)
         ).plot(kind="bar")
         plt.title("Mean Return per Bucket (per holding period)")
         plt.ylabel("Mean H-day return")
-        plt.xlabel("Bucket")
+        plt.xlabel("Bucket (1=worst, N=best)")
         plt.tight_layout()
         plt.show()
 
+        # 3) Bucket cumulative curves (all buckets; can be busy but useful for diagnosis)
         plt.figure()
         eq_all = (1.0 + bucket_ret.fillna(0.0)).cumprod()
         eq_all.plot(legend=True)
@@ -310,62 +501,103 @@ def make_tearsheet(
         plt.tight_layout()
         plt.show()
 
-        # Drawdown plot (top/bottom/benchmark)
-        top_col = "bucket_1"
-        bot_col = f"bucket_{n_buckets}"
-
+        # 4) Drawdown plot: best vs worst vs benchmark (if any)
         plt.figure()
-        dd_top = drawdown_series_from_equity(equity_curve(bucket_ret[top_col]))
-        dd_bot = drawdown_series_from_equity(equity_curve(bucket_ret[bot_col]))
 
-        if len(dd_top): dd_top.plot(label=f"{top_col} (max_dd={dd_top.min():.2%})")
-        if len(dd_bot): dd_bot.plot(label=f"{bot_col} (max_dd={dd_bot.min():.2%})")
+        dd_best = drawdown_series_from_equity(equity_curve(bucket_ret[best_col]))
+        dd_worst = drawdown_series_from_equity(equity_curve(bucket_ret[worst_col]))
+
+        if len(dd_best):
+            dd_best.plot(label=f"{best_col} (BEST, max_dd={dd_best.min():.2%})")
+        if len(dd_worst):
+            dd_worst.plot(label=f"{worst_col} (WORST, max_dd={dd_worst.min():.2%})")
         if bench_dd is not None and len(bench_dd):
             bench_dd.plot(label=f"{benchmark_name} (max_dd={bench_dd.min():.2%})")
 
-        plt.title("Drawdown Curves (Top / Bottom / Benchmark)")
+        plt.title("Drawdown Curves (Best / Worst / Benchmark)")
         plt.ylabel("Drawdown")
         plt.xlabel("Date")
         plt.legend()
         plt.tight_layout()
         plt.show()
 
-        # Yearly returns bar
-        yr_top = yearly_returns(bucket_ret[top_col]).rename(top_col)
-        yr_bot = yearly_returns(bucket_ret[bot_col]).rename(bot_col)
-        parts = [yr_top, yr_bot]
+        # 5) Long-short equity + drawdown (very high signal-to-noise diagnostic)
+        plt.figure()
+        ls_eq.plot()
+        plt.title("Long-Short Equity (Best - Worst)")
+        plt.ylabel("Equity")
+        plt.xlabel("Date")
+        plt.tight_layout()
+        plt.show()
+
+        plt.figure()
+        if len(ls_dd):
+            ls_dd.plot(label=f"LS (max_dd={ls_dd.min():.2%})")
+        plt.title("Long-Short Drawdown (Best - Worst)")
+        plt.ylabel("Drawdown")
+        plt.xlabel("Date")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        # 6) Yearly returns bar: best/worst/benchmark/LS
+        yr_best = yearly_returns(bucket_ret[best_col]).rename(best_col)
+        yr_worst = yearly_returns(bucket_ret[worst_col]).rename(worst_col)
+
+        parts = [yr_best, yr_worst, ls_yearly]
         if bench_yearly is not None and len(bench_yearly):
             parts.append(bench_yearly)
+
         yr_tbl = pd.concat(parts, axis=1).sort_index()
         if len(yr_tbl):
             plt.figure(figsize=(10, 5))
             yr_tbl.plot(kind="bar")
-            plt.title("Calendar-Year Returns (Top / Bottom / Benchmark)")
+            plt.title("Calendar-Year Returns (Best / Worst / LS / Benchmark)")
             plt.ylabel("Return")
             plt.xlabel("Year")
             plt.tight_layout()
             plt.show()
 
+    # --- report dict ---
     return {
         "meta": {
             "H": H,
             "n_buckets": n_buckets,
             "entry_mode": entry_mode,
-            "freq": freq,
-            "rolling_window_obs": rolling_window_obs,
+            "freq_per_year": float(freq_per_year),
+            "rolling_window_obs": int(rolling_window_obs),
             "universe_size": int(signal.shape[1]),
             "n_rebalance_obs": int(len(rebalance_dates)),
+            "bucket_convention": "bucket_1 = worst, bucket_n = best",
         },
         "bucket_ret": bucket_ret,
-        "benchmark_ret": bench_ret,
         "bucket_labels": bucket_lbl,
         "ret_fwd": ret_fwd,
         "coverage": coverage,
         "n_valid": n_valid,
         "ic": ic,
         "ic_stats": ic_stats,
+        "ic_roll": ic_roll,
         "bucket_summary": bucket_summary,
         "monotonic_spearman_bucket_vs_mean": monotonic_spearman,
-        "turnover_bottom": turnover_bottom,
-        "turnover_top": turnover_top,
+
+        # Semantically correct naming under your convention
+        "best_bucket": best_col,
+        "worst_bucket": worst_col,
+        "turnover_best": turnover_best,
+        "turnover_worst": turnover_worst,
+
+        # Long-short factor view (best - worst)
+        "ls_ret": ls_ret,
+        "ls_perf": ls_perf,
+        "ls_eq": ls_eq,
+        "ls_dd": ls_dd,
+        "ls_yearly": ls_yearly,
+
+        # Benchmark (optional)
+        "benchmark_ret": bench_ret,
+        "benchmark_perf": bench_perf,
+        "benchmark_eq": bench_eq,
+        "benchmark_dd": bench_dd,
+        "benchmark_yearly": bench_yearly,
     }

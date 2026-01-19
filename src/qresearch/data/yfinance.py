@@ -1,14 +1,85 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Union
-
+from typing import Iterable, Optional, Sequence, Union, List
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
+from qresearch.data.types import MarketData
 
 Tickers = Union[str, Sequence[str]]
+
+
+def download_market_data(
+        tickers: Union[str, List[str]],  # Adjusted type hint for clarity
+        start: str,
+        end: Optional[str] = None,
+        *,
+        auto_adjust_close: bool = True,
+        ffill: bool = True,
+        drop_all_nan_rows: bool = True,
+) -> MarketData:
+    """
+    Download MarketData bundle with progress tracking.
+    """
+    tick_list = _as_list(tickers)
+    n_tickers = len(tick_list)
+
+    print(f"[-] Initializing download for {n_tickers} tickers...")
+    print(f"    Date Range: {start} -> {end if end else 'Now'}")
+
+    # 1) OHLCV raw
+    # NOTE: Ensure your download_ohlc function passes `progress=True` to yf.download internally
+    # so you see the bar like: [*********************100%***********************]  2000 of 2000 completed
+    try:
+        ohlc = download_ohlc(
+            tick_list,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            ffill=ffill,
+            drop_all_nan_rows=drop_all_nan_rows,
+        )
+        print(f"[✓] Download complete. Shape: {ohlc.shape}")
+    except Exception as e:
+        print(f"[!] Critical Error during download: {e}")
+        raise e
+
+    # Helper to extract field->DataFrame
+    def _field_df(field: str) -> Optional[pd.DataFrame]:
+        print(f"    Processing field: {field}...", end="\r")  # \r overwrites the line for a cleaner look
+
+        if not isinstance(ohlc.columns, pd.MultiIndex):
+            return None
+        # Check Level 0 (Price Type)
+        if field not in ohlc.columns.get_level_values(0):
+            print(f"    [!] Warning: Field '{field}' not found in data.")
+            return None
+
+        df = ohlc[field].copy()
+        return df
+
+    # 2) Extract Fields
+    print("[-] Extracting and aligning components...")
+
+    # FIX: Changed "close" to "Close" (yfinance returns Title Case)
+    close = _field_df("Close")
+    open_ = _field_df("Open")
+    high = _field_df("High")
+    low = _field_df("Low")
+    volume = _field_df("Volume")
+
+
+    print("[✓] MarketData object created.")
+
+    return MarketData(
+        close=close,
+        open=open_,
+        high=high,
+        low=low,
+        volume=volume,
+    )
+
 
 
 def _as_list(tickers: Tickers) -> list[str]:
@@ -101,7 +172,7 @@ def download_close(
         start=start,
         end=end,
         auto_adjust=auto_adjust,
-        progress=False,
+        progress=True,
         group_by="column",  # most stable; we handle both orientations anyway
         threads=True,
     )
@@ -151,7 +222,7 @@ def download_ohlc(
         start=start,
         end=end,
         auto_adjust=auto_adjust,  # keep False if you need raw Open/Close
-        progress=False,
+        progress=True,
         group_by="column",
         threads=True,
     )
