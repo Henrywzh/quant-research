@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+
 from typing import Any, Dict, Optional, Tuple, Literal
 import numpy as np
 import pandas as pd
@@ -15,36 +15,8 @@ from qresearch.backtest.metrics import (
 )
 from qresearch.data.types import MarketData
 
+
 EntryMode = Literal["next_close", "next_open", "open_to_close"]
-
-
-@dataclass(frozen=True)
-class UniverseFilterConfig:
-    """
-    Universe filter based on rolling MA price floor.
-
-    Example:
-      - window=21
-      - min_ma_price=1.0  (exclude penny-ish HK stocks)
-    """
-    ma_window: int = 21
-    min_ma_price: float = 1.0
-
-
-def compute_ma_price_eligibility(
-    close: pd.DataFrame,
-    cfg: UniverseFilterConfig,
-) -> pd.DataFrame:
-    """
-    Returns a boolean DataFrame (date x ticker):
-      eligible[t, i] = True if MA_window(close)[t, i] >= min_ma_price
-
-    No lookahead:
-    - MA at date t uses close up to t (inclusive).
-    """
-    ma = close.rolling(cfg.ma_window, min_periods=cfg.ma_window).mean()
-    eligible = ma >= cfg.min_ma_price
-    return eligible
 
 
 def bucket_backtest(
@@ -349,6 +321,7 @@ def make_tearsheet(
     rolling_window_obs: Optional[int] = None,
     benchmark_price: Optional[pd.DataFrame | pd.Series] = None,
     benchmark_name: str = "Benchmark",
+    universe_eligible: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """
     Standard tear sheet for your bucket backtest framework.
@@ -370,16 +343,13 @@ def make_tearsheet(
     # --- run backtest ---
     close = md.close
 
-    uf_cfg = UniverseFilterConfig(ma_window=21, min_ma_price=1.0)
-    eligible = compute_ma_price_eligibility(close, uf_cfg)
-
     bucket_ret, bucket_lbl, ret_fwd = bucket_backtest(
         md=md,
         signal=signal,  # date x ticker, computed at close[t]
         H=H,
         n_buckets=n_buckets,
         entry_mode=entry_mode,
-        universe_eligible=eligible,
+        universe_eligible=universe_eligible,
     )
 
     rebalance_dates = bucket_ret.index

@@ -71,30 +71,6 @@ def marketdata_to_yfinance(md: MarketData) -> pd.DataFrame:
     return yf_df.sort_index(axis=1)
 
 
-def yfinance_to_marketdata(df: pd.DataFrame) -> MarketData:
-    """
-    Converts a yfinance-style MultiIndex DataFrame back into a MarketData object.
-    Handles missing fields gracefully by creating empty DataFrames if needed.
-    """
-
-    # Helper to safely extract a field or return an empty DF
-    def _extract(field: str):
-        # Handle case sensitivity (yfinance uses Title case: 'Close', 'Volume')
-        if field in df.columns.get_level_values(0):
-            return df[field].copy()
-        else:
-            print(f"Warning: '{field}' not found in DataFrame.")
-            return pd.DataFrame()
-
-    return MarketData(
-        close=_extract('Close'),
-        open=_extract('Open'),
-        high=_extract('High'),
-        low=_extract('Low'),
-        volume=_extract('Volume')
-    )
-
-
 def save_yf_data(df: pd.DataFrame, file_path: Path | str) -> None:
     """
     Saves a yfinance MultiIndex DataFrame to CSV, preserving the hierarchy.
@@ -122,6 +98,30 @@ def load_yf_data(file_path: Path | str) -> pd.DataFrame:
     return df
 
 
+def yfinance_to_marketdata(df: pd.DataFrame) -> MarketData:
+    """
+    Converts a yfinance-style MultiIndex DataFrame back into a MarketData object.
+    Handles missing fields gracefully by creating empty DataFrames if needed.
+    """
+
+    # Helper to safely extract a field or return an empty DF
+    def _extract(field: str):
+        # Handle case sensitivity (yfinance uses Title case: 'Close', 'Volume')
+        if field in df.columns.get_level_values(0):
+            return df[field].copy()
+        else:
+            print(f"Warning: '{field}' not found in DataFrame.")
+            return pd.DataFrame()
+
+    return MarketData(
+        close=_extract('Close'),
+        open=_extract('Open'),
+        high=_extract('High'),
+        low=_extract('Low'),
+        volume=_extract('Volume')
+    )
+
+
 def get_processed_dir() -> Path:
     """
     Finds the 'data/processed' directory by searching up the directory tree.
@@ -136,6 +136,29 @@ def get_processed_dir() -> Path:
         data_dir = path / 'data'
         if data_dir.exists():
             processed_dir = data_dir / 'processed'
+
+            # Create 'processed' if it is missing (good safety habit)
+            processed_dir.mkdir(parents=True, exist_ok=True)
+
+            return processed_dir
+
+    raise FileNotFoundError("Could not locate the 'data' folder in any parent directory.")
+
+
+def get_raw_dir() -> Path:
+    """
+    Finds the 'data/processed' directory by searching up the directory tree.
+    Automatically creates the folder if it doesn't exist.
+    """
+    # Start from the current working directory
+    current_path = Path.cwd()
+
+    # Check current folder and all parent folders
+    for path in [current_path] + list(current_path.parents):
+        # Look for the 'data' folder in this path
+        data_dir = path / 'data'
+        if data_dir.exists():
+            processed_dir = data_dir / 'raw'
 
             # Create 'processed' if it is missing (good safety habit)
             processed_dir.mkdir(parents=True, exist_ok=True)

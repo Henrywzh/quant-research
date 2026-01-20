@@ -4,7 +4,8 @@ from typing import Literal, Tuple
 import numpy as np
 import pandas as pd
 
-TRADING_DAYS = 252
+from qresearch.backtest.metrics import TRADING_DAYS
+
 FillPolicy = Literal["zero", "ffill", "error"]
 
 

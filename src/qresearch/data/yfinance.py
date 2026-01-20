@@ -254,3 +254,15 @@ def download_ohlc(
         out = out.dropna(how="all")
 
     return out
+
+
+def download_mcap_snapshot_yf(tickers: list[str]) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info
+            rows.append({"ticker": t, "market_cap": info.get("marketCap")})
+        except Exception as e:
+            rows.append({"ticker": t, "market_cap": np.nan})
+
+    return pd.DataFrame(rows)
