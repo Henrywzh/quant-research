@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from typing import Any, Dict, Optional, Tuple, Literal
 import numpy as np
 import pandas as pd
@@ -26,34 +25,64 @@ def bucket_backtest(
     n_buckets: int = 10,
     entry_mode: EntryMode = "next_close",
     universe_eligible: Optional[pd.DataFrame] = None,
+    *,
+    ffill_labels: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Cross-sectional bucket backtest (non-overlapping holding periods).
 
-    IMPORTANT bucket convention (your choice):
-    bucket_1 = WORST (lowest signal)
-    bucket_n = BEST  (highest signal)
+    Contract / conventions (non-negotiable):
+    - signal is computed at close[t]
+    - positions are formed on date t using signal[t] and eligibility[t]
+    - entry occurs on t+1 (depending on entry_mode)
+    - exit occurs on t+H+1
+    - forward return used for evaluation is:
+        ret_fwd[t] = exit_px(t+H+1) / entry_px(t+1) - 1
 
-    universe_eligible (optional):
-    - boolean DataFrame (date x ticker)
-    - True means the asset is eligible on formation date t
+    Bucket convention (IMPORTANT):
+    - bucket_1 = WORST  (lowest signal)
+    - bucket_n = BEST   (highest signal)
+
+    Universe eligibility (optional):
+    - universe_eligible is a boolean DataFrame (date x ticker)
+    - universe_eligible[t, i] == True means ticker i is allowed to be ranked / traded at formation date t
+    - eligibility is applied BEFORE ranking and bucketing (formation-date gate)
+
+    Non-overlapping rebalances:
+    - Rebalance dates are every H trading days on the close index grid:
+        rebalance_dates = dates[::H]
+      This means each rebalance forms a portfolio held for H days, then liquidated, then reformed.
+
+    Outputs:
+    - bucket_ret: DataFrame indexed by rebalance dates with columns bucket_1..bucket_n,
+                 values are mean forward returns (H-day, non-overlapping) of each bucket at that rebalance.
+    - bucket_lbl: DataFrame indexed by all dates and columns tickers,
+                  values are bucket id on rebalance dates (NaN elsewhere unless ffill_labels=True).
+    - ret_fwd: DataFrame (date x ticker) of forward returns consistent with entry/exit convention above.
+
+    Notes:
+    - Uses a small epsilon tie-breaker to stabilize bucketing for discrete or tied signals.
+    - Uses pd.qcut on ranks to produce near-equal-count buckets; falls back to arithmetic binning if qcut fails.
+    - If ffill_labels=True, bucket_lbl is forward-filled for up to H-1 days to represent "held membership".
+      Keep this OFF unless you explicitly need held-period labels; it can be misinterpreted as formation labels.
     """
-    close = md.close.sort_index()
 
-    # Defensive: keep signal universe consistent with price universe.
-    # This prevents "extra tickers" in signal from causing index unions later.
+    close = md.close.sort_index()
     signal = signal.reindex(index=close.index, columns=close.columns)
 
-    # Entry/exit prices aligned with "signal computed at close[t]"
-    # ret_fwd[t] = exit(t+H+1)/entry(t+1) - 1
+    # forward returns
     if entry_mode == "next_close":
         entry_px = close.shift(-1)
         exit_px = close.shift(-(H + 1))
     elif entry_mode == "next_open":
+        if md.open is None:
+            raise ValueError("md.open is required for entry_mode='next_open'")
         open_ = md.open.sort_index()
         entry_px = open_.shift(-1)
         exit_px = open_.shift(-(H + 1))
     elif entry_mode == "open_to_close":
+        if md.open is None:
+            raise ValueError("md.open is required for entry_mode='open_to_close'")
         open_ = md.open.sort_index()
         entry_px = open_.shift(-1)
         exit_px = close.shift(-(H + 1))
@@ -63,20 +92,12 @@ def bucket_backtest(
     ret_fwd = exit_px / entry_px - 1
 
     dates = close.index
-    n_dates = len(dates)
-
-    # Rebalance dates: every H days (non-overlapping positions)
-    rebalance_mask = np.zeros(n_dates, dtype=bool)
-    rebalance_mask[::H] = True
-    rebalance_dates = dates[rebalance_mask]
+    rebalance_dates = dates[::H]  # non-overlapping grid
 
     bucket_ret = {f"bucket_{k}": [] for k in range(1, n_buckets + 1)}
     out_dates = []
-
-    # Keep labels on the same grid as our price universe (not signal.columns, which might drift).
     bucket_lbl = pd.DataFrame(index=dates, columns=close.columns, dtype=float)
 
-    # Align eligibility grid (if provided) once (cheap, avoids shape bugs)
     if universe_eligible is not None:
         universe_eligible = (
             universe_eligible.reindex(index=dates, columns=close.columns)
@@ -85,60 +106,37 @@ def bucket_backtest(
         )
 
     for t in rebalance_dates:
-        # With the reindex above, t is in signal/ret_fwd indexes, but keep the guard anyway.
-        if t not in signal.index or t not in ret_fwd.index:
-            continue
+        sig_t = signal.loc[t]
+        ret_t = ret_fwd.loc[t]
 
-        sig_t = signal.loc[t]     # Series indexed by ticker
-        ret_t = ret_fwd.loc[t]    # Series indexed by ticker
-
-        # --- HARD ALIGNMENT (this is the critical fix) ---
-        # Ensure sig_t, ret_t, and elig_t all share exactly the same ticker index.
-        common = sig_t.index.intersection(ret_t.index)
-        if universe_eligible is not None:
-            common = common.intersection(universe_eligible.columns)
-
-        # If the available universe is too small, skip.
-        if len(common) < n_buckets:
-            continue
-
-        sig_t = sig_t.reindex(common)
-        ret_t = ret_t.reindex(common)
-
-        # Base validity: have signal AND realized forward return
         valid_mask = sig_t.notna() & ret_t.notna()
-
-        # Apply universe eligibility on formation date t (e.g., exclude penny stocks)
         if universe_eligible is not None:
-            elig_t = universe_eligible.loc[t].reindex(common).fillna(False).astype(bool)
-            valid_mask = valid_mask & elig_t
+            valid_mask &= universe_eligible.loc[t].fillna(False).astype(bool)
 
-        # IMPORTANT: use Series boolean filtering, not Index boolean indexing
-        valid_tickers = sig_t[valid_mask].index
-
-        if len(valid_tickers) < n_buckets:
+        if valid_mask.sum() < n_buckets:
             continue
 
-        sig_valid = sig_t.loc[valid_tickers]
+        sig_valid = sig_t[valid_mask].astype(float)
 
-        # tie-breaker for discrete signals (ensures stable bucketing)
+        # tie-breaker for discrete signals
         eps = pd.Series(np.arange(len(sig_valid), dtype=float), index=sig_valid.index) * 1e-12
         sig_valid = sig_valid + eps
 
-        # bucket_1 = worst => rank ascending
-        ranks = sig_valid.rank(ascending=True, method="average")
+        # stable equal-count buckets (1..n, where 1=worst)
+        ranks = sig_valid.rank(ascending=True, method="first")
+        try:
+            bucket_ids = pd.qcut(ranks, q=n_buckets, labels=range(1, n_buckets + 1))
+            bucket_ids = bucket_ids.astype(int)
+        except ValueError:
+            # fallback to your original sizing if qcut fails
+            n_valid = len(sig_valid)
+            bucket_size = n_valid / n_buckets
+            bucket_ids = ((ranks - 1) / bucket_size).astype(int) + 1
+            bucket_ids = bucket_ids.clip(1, n_buckets).astype(int)
 
-        n_valid = len(valid_tickers)
-        bucket_size = n_valid / n_buckets
+        bucket_lbl.loc[t, bucket_ids.index] = bucket_ids
 
-        bucket_ids = ((ranks - 1) / bucket_size).astype(int) + 1
-        bucket_ids = bucket_ids.clip(1, n_buckets)
-
-        bucket_lbl.loc[t, valid_tickers] = bucket_ids
-
-        # Use ret_t (already aligned) to avoid reintroducing index mismatch
-        r_fwd_t = ret_t.loc[valid_tickers]
-
+        r_fwd_t = ret_t.loc[bucket_ids.index]
         for k in range(1, n_buckets + 1):
             members = bucket_ids.index[bucket_ids == k]
             bucket_ret[f"bucket_{k}"].append(r_fwd_t[members].mean() if len(members) else np.nan)
@@ -146,168 +144,11 @@ def bucket_backtest(
         out_dates.append(t)
 
     bucket_ret = pd.DataFrame(bucket_ret, index=out_dates)
-    bucket_lbl = bucket_lbl.ffill()
+
+    if ffill_labels:
+        bucket_lbl = bucket_lbl.ffill(limit=H-1)
 
     return bucket_ret, bucket_lbl, ret_fwd
-
-
-def _compute_ic_spearman(
-    signal: pd.DataFrame,
-    ret_fwd: pd.DataFrame,
-    dates: pd.Index,
-    min_assets: int,
-) -> pd.Series:
-    """
-    Spearman IC on each rebalance date.
-    signal[t, :] vs ret_fwd[t, :]
-    """
-    signal = signal.reindex(index=ret_fwd.index)
-    dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
-
-    ic_vals = []
-    for dt in dates:
-        x = signal.loc[dt]
-        y = ret_fwd.loc[dt]
-        m = x.notna() & y.notna()
-        ic_vals.append(x[m].corr(y[m], method="spearman") if m.sum() >= min_assets else np.nan)
-
-    return pd.Series(ic_vals, index=dates, name="IC_spearman")
-
-
-def _compute_coverage_and_nvalid(
-    signal: pd.DataFrame,
-    ret_fwd: pd.DataFrame,
-    dates: pd.Index,
-) -> Tuple[pd.Series, pd.Series]:
-    """
-    Coverage diagnostics on rebalance dates:
-    - fraction of universe that is valid (signal and ret_fwd both available)
-    - count of valid assets
-    """
-    dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
-    universe_size = signal.shape[1]
-
-    cov, nvalid = [], []
-    for dt in dates:
-        m = signal.loc[dt].notna() & ret_fwd.loc[dt].notna()
-        n = int(m.sum())
-        nvalid.append(n)
-        cov.append(n / universe_size if universe_size > 0 else np.nan)
-
-    return (
-        pd.Series(cov, index=dates, name="coverage"),
-        pd.Series(nvalid, index=dates, name="n_valid"),
-    )
-
-
-def _turnover_proxy_from_labels(
-    bucket_lbl: pd.DataFrame,
-    rebalance_dates: pd.Index,
-    bucket_k: int,
-) -> pd.Series:
-    """
-    Simple turnover proxy for a given bucket:
-    turnover(t) = 1 - overlap(members_t, members_{t-1}) / len(members_t)
-    """
-    dts = pd.Index(rebalance_dates).intersection(bucket_lbl.index)
-
-    prev_members = None
-    vals = []
-    for dt in dts:
-        lbl = bucket_lbl.loc[dt]
-        members = set(lbl.index[lbl == bucket_k])
-
-        if prev_members is None or len(members) == 0:
-            vals.append(np.nan)
-        else:
-            overlap = len(members.intersection(prev_members))
-            vals.append(1.0 - overlap / len(members))
-
-        prev_members = members
-
-    return pd.Series(vals, index=dts, name=f"turnover_bucket_{bucket_k}")
-
-
-def _as_series(x: pd.Series | pd.DataFrame, *, name: str) -> pd.Series:
-    """
-    Normalize a Series-or-1col-DataFrame into a Series.
-    If x is a multi-column DataFrame, raise with a clear error.
-    """
-    if isinstance(x, pd.Series):
-        return x.rename(name)
-
-    if isinstance(x, pd.DataFrame):
-        if x.shape[1] == 1:
-            return x.iloc[:, 0].rename(name)
-
-        # Multi-column benchmark is ambiguous: you must choose one
-        raise ValueError(
-            f"Benchmark resolved to a DataFrame with {x.shape[1]} columns. "
-            f"Please pass a single benchmark Series, or a 1-column DataFrame. "
-            f"Columns preview: {list(x.columns)[:10]}"
-        )
-
-    raise TypeError(f"Expected Series or DataFrame, got {type(x)}")
-
-
-def _compute_benchmark_ret_fwd(
-    bench_price: pd.DataFrame | pd.Series,
-    H: int,
-    entry_mode: EntryMode,
-) -> pd.Series:
-    # --- pick the price series(s) ---
-    if isinstance(bench_price, pd.Series):
-        px_close = bench_price.sort_index()
-        px_open = None
-
-    else:
-        bench_df = bench_price.sort_index()
-
-        # yfinance-style MultiIndex columns: ["Open","Close",...] at level 0
-        if isinstance(bench_df.columns, pd.MultiIndex):
-            if "Close" not in bench_df.columns.get_level_values(0):
-                raise KeyError("Benchmark MultiIndex DataFrame must contain level-0 'Close'.")
-            px_close = bench_df["Close"]
-            px_open = bench_df["Open"] if "Open" in bench_df.columns.get_level_values(0) else None
-        else:
-            cols = list(bench_df.columns)
-            if "Close" in cols:
-                px_close = bench_df["Close"]
-                px_open = bench_df["Open"] if "Open" in cols else None
-            elif len(cols) == 1:
-                px_close = bench_df.iloc[:, 0]
-                px_open = None
-            else:
-                raise KeyError(
-                    f"Benchmark DataFrame must have 'Close' or be 1-column. Got: {cols[:10]}..."
-                )
-
-    # --- normalize: ensure close/open are Series (not DataFrame) ---
-    px_close = _as_series(px_close, name="bench_close")
-    if px_open is not None:
-        px_open = _as_series(px_open, name="bench_open")
-
-    # --- compute forward return consistent with your backtest convention ---
-    if entry_mode == "open_to_close":
-        if px_open is None:
-            raise ValueError("entry_mode='open_to_close' requires benchmark Open & Close.")
-        entry_px = px_open.shift(-1)
-        exit_px = px_close.shift(-(H + 1))
-        out = exit_px / entry_px - 1.0
-
-    elif entry_mode == "next_open":
-        if px_open is None:
-            raise ValueError("entry_mode='next_open' requires benchmark Open.")
-        entry_px = px_open.shift(-1)
-        exit_px = px_open.shift(-(H + 1))
-        out = exit_px / entry_px - 1.0
-
-    else:  # "next_close"
-        entry_px = px_close.shift(-1)
-        exit_px = px_close.shift(-(H + 1))
-        out = exit_px / entry_px - 1.0
-
-    return out.rename("benchmark_ret_fwd")
 
 
 def make_tearsheet(
@@ -571,3 +412,162 @@ def make_tearsheet(
         "benchmark_dd": bench_dd,
         "benchmark_yearly": bench_yearly,
     }
+
+
+def _compute_ic_spearman(
+    signal: pd.DataFrame,
+    ret_fwd: pd.DataFrame,
+    dates: pd.Index,
+    min_assets: int,
+) -> pd.Series:
+    """
+    Spearman IC on each rebalance date.
+    signal[t, :] vs ret_fwd[t, :]
+    """
+    signal = signal.reindex(index=ret_fwd.index)
+    dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
+
+    ic_vals = []
+    for dt in dates:
+        x = signal.loc[dt]
+        y = ret_fwd.loc[dt]
+        m = x.notna() & y.notna()
+        ic_vals.append(x[m].corr(y[m], method="spearman") if m.sum() >= min_assets else np.nan)
+
+    return pd.Series(ic_vals, index=dates, name="IC_spearman")
+
+
+def _compute_coverage_and_nvalid(
+    signal: pd.DataFrame,
+    ret_fwd: pd.DataFrame,
+    dates: pd.Index,
+) -> Tuple[pd.Series, pd.Series]:
+    """
+    Coverage diagnostics on rebalance dates:
+    - fraction of universe that is valid (signal and ret_fwd both available)
+    - count of valid assets
+    """
+    dates = pd.Index(dates).intersection(signal.index).intersection(ret_fwd.index)
+    universe_size = signal.shape[1]
+
+    cov, nvalid = [], []
+    for dt in dates:
+        m = signal.loc[dt].notna() & ret_fwd.loc[dt].notna()
+        n = int(m.sum())
+        nvalid.append(n)
+        cov.append(n / universe_size if universe_size > 0 else np.nan)
+
+    return (
+        pd.Series(cov, index=dates, name="coverage"),
+        pd.Series(nvalid, index=dates, name="n_valid"),
+    )
+
+
+def _turnover_proxy_from_labels(
+    bucket_lbl: pd.DataFrame,
+    rebalance_dates: pd.Index,
+    bucket_k: int,
+) -> pd.Series:
+    """
+    Simple turnover proxy for a given bucket:
+    turnover(t) = 1 - overlap(members_t, members_{t-1}) / len(members_t)
+    """
+    dts = pd.Index(rebalance_dates).intersection(bucket_lbl.index)
+
+    prev_members = None
+    vals = []
+    for dt in dts:
+        lbl = bucket_lbl.loc[dt]
+        members = set(lbl.index[lbl == bucket_k])
+
+        if prev_members is None or len(members) == 0:
+            vals.append(np.nan)
+        else:
+            overlap = len(members.intersection(prev_members))
+            vals.append(1.0 - overlap / len(members))
+
+        prev_members = members
+
+    return pd.Series(vals, index=dts, name=f"turnover_bucket_{bucket_k}")
+
+
+def _as_series(x: pd.Series | pd.DataFrame, *, name: str) -> pd.Series:
+    """
+    Normalize a Series-or-1col-DataFrame into a Series.
+    If x is a multi-column DataFrame, raise with a clear error.
+    """
+    if isinstance(x, pd.Series):
+        return x.rename(name)
+
+    if isinstance(x, pd.DataFrame):
+        if x.shape[1] == 1:
+            return x.iloc[:, 0].rename(name)
+
+        # Multi-column benchmark is ambiguous: you must choose one
+        raise ValueError(
+            f"Benchmark resolved to a DataFrame with {x.shape[1]} columns. "
+            f"Please pass a single benchmark Series, or a 1-column DataFrame. "
+            f"Columns preview: {list(x.columns)[:10]}"
+        )
+
+    raise TypeError(f"Expected Series or DataFrame, got {type(x)}")
+
+
+def _compute_benchmark_ret_fwd(
+    bench_price: pd.DataFrame | pd.Series,
+    H: int,
+    entry_mode: EntryMode,
+) -> pd.Series:
+    # --- pick the price series(s) ---
+    if isinstance(bench_price, pd.Series):
+        px_close = bench_price.sort_index()
+        px_open = None
+
+    else:
+        bench_df = bench_price.sort_index()
+
+        # yfinance-style MultiIndex columns: ["Open","Close",...] at level 0
+        if isinstance(bench_df.columns, pd.MultiIndex):
+            if "Close" not in bench_df.columns.get_level_values(0):
+                raise KeyError("Benchmark MultiIndex DataFrame must contain level-0 'Close'.")
+            px_close = bench_df["Close"]
+            px_open = bench_df["Open"] if "Open" in bench_df.columns.get_level_values(0) else None
+        else:
+            cols = list(bench_df.columns)
+            if "Close" in cols:
+                px_close = bench_df["Close"]
+                px_open = bench_df["Open"] if "Open" in cols else None
+            elif len(cols) == 1:
+                px_close = bench_df.iloc[:, 0]
+                px_open = None
+            else:
+                raise KeyError(
+                    f"Benchmark DataFrame must have 'Close' or be 1-column. Got: {cols[:10]}..."
+                )
+
+    # --- normalize: ensure close/open are Series (not DataFrame) ---
+    px_close = _as_series(px_close, name="bench_close")
+    if px_open is not None:
+        px_open = _as_series(px_open, name="bench_open")
+
+    # --- compute forward return consistent with your backtest convention ---
+    if entry_mode == "open_to_close":
+        if px_open is None:
+            raise ValueError("entry_mode='open_to_close' requires benchmark Open & Close.")
+        entry_px = px_open.shift(-1)
+        exit_px = px_close.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
+
+    elif entry_mode == "next_open":
+        if px_open is None:
+            raise ValueError("entry_mode='next_open' requires benchmark Open.")
+        entry_px = px_open.shift(-1)
+        exit_px = px_open.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
+
+    else:  # "next_close"
+        entry_px = px_close.shift(-1)
+        exit_px = px_close.shift(-(H + 1))
+        out = exit_px / entry_px - 1.0
+
+    return out.rename("benchmark_ret_fwd")

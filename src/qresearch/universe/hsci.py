@@ -19,6 +19,8 @@ def build_hsci_ticker_master(
     Build survivorship-safe ticker master:
         tickers_ever = (2008 snapshot tickers) U (all tickers appearing in history events)
 
+    TODO: (2008 snapshot tickers) U (all tickers appearing in history events) U (current hsci components)
+
     Returns a DataFrame with:
         ticker, in_seed_2008, in_history_events
     """
@@ -155,8 +157,8 @@ def build_hsci_events_from_history(
     out_cols = ["effective_date", "ticker", "action"]
     if sheet_col in df.columns:
         out_cols.append(sheet_col)
-    if "Sector" in df.columns:
-        out_cols.append("Sector")
+    if "sector" in df.columns:
+        out_cols.append("sector")
 
     events = df[out_cols].dropna(subset=["effective_date", "ticker", "action"]).copy()
 

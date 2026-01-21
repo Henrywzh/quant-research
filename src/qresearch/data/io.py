@@ -361,17 +361,6 @@ def load_hsci_2008_components(fname: str = "hsci_components_2008.csv") -> pd.Dat
     return pd.read_csv(get_raw_dir() / fname)
 
 
-def _extract_sector_from_a2(path: str, sheet_name: str) -> str | None:
-    wb = load_workbook(path, data_only=True)
-    ws = wb[sheet_name]
-    v = ws["A2"].value
-    if v is None:
-        return None
-    v = str(v).strip()
-    m = SECTOR_RE.search(v)
-    return m.group(1).strip() if m else None
-
-
 def read_constituents_sheet(path: str, sheet_name: str, header_row_excel: int = 5) -> pd.DataFrame:
     header_idx = header_row_excel - 1
     df = pd.read_excel(path, sheet_name=sheet_name, header=header_idx, engine="openpyxl")
@@ -405,3 +394,14 @@ def read_constituents_sheet(path: str, sheet_name: str, header_row_excel: int = 
     df["Sector"] = sector
 
     return df
+
+
+def _extract_sector_from_a2(path: str, sheet_name: str) -> str | None:
+    wb = load_workbook(path, data_only=True)
+    ws = wb[sheet_name]
+    v = ws["A2"].value
+    if v is None:
+        return None
+    v = str(v).strip()
+    m = SECTOR_RE.search(v)
+    return m.group(1).strip() if m else None

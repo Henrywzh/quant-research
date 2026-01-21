@@ -10,15 +10,15 @@ from qresearch.data.types import MarketData
 @register_signal(
     "on_minus_id",
     description="(overnight momentum) - (intraday momentum) over same lookback",
-    defaults={"lookback": 21},
+    defaults={"lookback": 21, 'sign': -1},
     requires=("open", "close"),
 )
-def on_minus_id(md: MarketData, lookback: int = 20) -> pd.DataFrame:
+def on_minus_id(md: MarketData, lookback: int = 20, sign: int = -1) -> pd.DataFrame:
     r_on = md.open / md.close.shift(1) - 1.0
     r_id = md.close / md.open - 1.0
     on = np.exp(np.log1p(r_on).rolling(lookback).sum()) - 1.0
     id_ = np.exp(np.log1p(r_id).rolling(lookback).sum()) - 1.0
-    return on - id_
+    return sign * (on - id_)
 
 
 @register_signal(
@@ -50,28 +50,28 @@ def rsi(md: MarketData, lookback: int = 14) -> pd.DataFrame:
 @register_signal(
     "overnight_mom",
     description="Momentum on overnight returns: cumprod(1+r_on) over lookback - 1",
-    defaults={"lookback": 21},
+    defaults={"lookback": 21, 'sign': -1},
     requires=("open", "close"),
 )
-def overnight_mom(md: MarketData, lookback: int = 20) -> pd.DataFrame:
+def overnight_mom(md: MarketData, lookback: int = 20, sign: int = -1) -> pd.DataFrame:
     r_on = md.open / md.close.shift(1) - 1.0
-    return (1.0 + r_on).rolling(lookback).apply(np.prod, raw=True) - 1.0
+    return sign * ((1.0 + r_on).rolling(lookback).apply(np.prod, raw=True) - 1.0)
 
 @register_signal(
     "intraday_mom",
     description="Momentum on intraday returns: cumprod(1+r_id) over lookback - 1",
-    defaults={"lookback": 21},
+    defaults={"lookback": 21, 'sign': -1},
     requires=("open", "close"),
 )
-def intraday_mom(md: MarketData, lookback: int = 20) -> pd.DataFrame:
+def intraday_mom(md: MarketData, lookback: int = 20, sign: int = -1) -> pd.DataFrame:
     r_id = md.close / md.open - 1.0
-    return (1.0 + r_id).rolling(lookback).apply(np.prod, raw=True) - 1.0
+    return sign * ((1.0 + r_id).rolling(lookback).apply(np.prod, raw=True) - 1.0)
 
 
 @register_signal(
     "trend_annret_r2",
     description="Trend score = annualised return * R^2 (rolling OLS on log price)",
-    defaults={"lookback": 63, "ann_factor": 252, 'skip': 0},
+    defaults={"lookback": 252, "ann_factor": 252, 'skip': 21},
 )
 def trend_annret_r2(md: MarketData, lookback: int = 126, ann_factor: int = 252, skip: int = 0) -> pd.DataFrame:
     return trend_score_annret_r2(md.close, lookback=lookback, ann_factor=ann_factor, skip=skip)
@@ -105,10 +105,10 @@ def ma_diff(md: MarketData, lookback: int, skip: int = 0, sign: int = 1) -> pd.D
 @register_signal(
     "ma_angle",
     description="ma_angle, default lookback: 20",
-    defaults={"lookback": 20},
+    defaults={"lookback": 20, 'skip': 0},
     requires=("close",),
 )
-def ma_angle(md: MarketData, lookback: int = 20) -> pd.DataFrame:
+def ma_angle(md: MarketData, lookback: int = 20, skip: int = 0) -> pd.DataFrame:
     """
     Calculates the angle of the Moving Average (SMA) in degrees.
 
@@ -121,7 +121,7 @@ def ma_angle(md: MarketData, lookback: int = 20) -> pd.DataFrame:
         DataFrame with angles in degrees [-90, 90].
     """
     # 1. Prepare Close prices
-    close = md.close.sort_index()
+    close = md.close.shift(skip).sort_index()
 
     # 2. Calculate Moving Average (SMA)
     ma = close.rolling(window=lookback).mean()

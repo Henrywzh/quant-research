@@ -6,40 +6,37 @@ from qresearch.universe.hsci import build_hsci_member_mask
 def build_final_universe_eligible(
     close: pd.DataFrame,
     *,
-    events: pd.DataFrame,
-    seed_members: set[str] | None,
+    events: pd.DataFrame | None = None,
+    seed_members: set[str] | None = None,
     cfg: UniverseFilterConfig,
     mcap: pd.DataFrame | None = None,
     effective_on_close: bool = True,
 ) -> pd.DataFrame:
     """
-    Build the final formation-date universe eligibility mask:
+    final_eligible[t,i] = member_gate[t,i] & investable_filters[t,i]
 
-        final_eligible[t,i] = hsci_member[t,i] & investable_filters[t,i]
-
-    No lookahead:
-    - hsci_member uses effective_date <= t (applied on t close, per your rule)
-    - investable filters use rolling stats up to t (inclusive)
+    If events is None:
+      member_gate := True for all tickers/dates (i.e., no membership gating)
     """
-    # 1) membership gate (survivorship bias fix)
-    hsci_member = build_hsci_member_mask(
-        dates=close.index,
-        tickers=close.columns,
-        events=events,
-        seed_members=seed_members,
-        effective_on_close=effective_on_close
-    )
-    hsci_member = _align_bool(hsci_member, close)
+    # 1) membership gate
+    if events is None:
+        hsci_member = pd.DataFrame(True, index=close.index, columns=close.columns)
+    else:
+        hsci_member = build_hsci_member_mask(
+            dates=close.index,
+            tickers=close.columns,
+            events=events,
+            seed_members=seed_members,
+            effective_on_close=effective_on_close,
+        )
+        hsci_member = _align_bool(hsci_member, close)
 
-    # 2) investable filters (price floor / IPO age / mcap floor)
+    # 2) investable filters
     investable = build_universe_eligible(close=close, cfg=cfg, mcap=mcap)
     investable = _align_bool(investable, close)
 
-    # 3) final gate
-    final_eligible = hsci_member & investable
-    final_eligible = _align_bool(final_eligible, close)
-
-    return final_eligible
+    # 3) final
+    return _align_bool(hsci_member & investable, close)
 
 
 def prepare_universe_bundle(

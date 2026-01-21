@@ -1,3 +1,5 @@
+from typing import Optional
+
 import pandas as pd
 import numpy as np
 
@@ -34,98 +36,107 @@ def cs_winsorize_zscore(
     return sig.apply(_proc_row, axis=1)
 
 
-def sector_series_to_df(
-    sector: pd.Series,
-    dates: pd.Index,
-    tickers: pd.Index,
-) -> pd.DataFrame:
+def sector_series_to_df(sector_map, dates, tickers) -> pd.DataFrame:
     """
-    sector: pd.Series index=ticker, value=sector_code
-    returns: date×ticker DataFrame with repeated sector labels
+    sector_map: pd.Series (ticker->sector) OR 1-col pd.DataFrame (index=ticker).
+    returns: date×ticker DataFrame of sector labels.
     """
-    sec = sector.reindex(tickers)
-    sec_df = pd.DataFrame(np.tile(sec.to_numpy(), (len(dates), 1)),
-                          index=dates, columns=tickers)
-    return sec_df
+    if isinstance(sector_map, pd.DataFrame):
+        if sector_map.shape[1] != 1:
+            raise ValueError("sector_map DataFrame must have exactly 1 column (sector).")
+        sector_map = sector_map.iloc[:, 0]  # convert to Series
+
+    if not isinstance(sector_map, pd.Series):
+        raise TypeError("sector_map must be a pd.Series or 1-col pd.DataFrame.")
+
+    # Align to tickers in scores
+    sec_row = sector_map.reindex(pd.Index(tickers)).astype("object")  # Series length = len(tickers)
+
+    # Broadcast to all dates efficiently
+    out = pd.DataFrame(
+        [sec_row.to_numpy()] * len(dates),
+        index=dates,
+        columns=pd.Index(tickers),
+    )
+    return out
 
 
 def to_log_mcap(mcap: pd.DataFrame) -> pd.DataFrame:
-    """
-    mcap: date×ticker market cap (must be >0)
-    returns: date×ticker ln(mcap)
-    """
-    mc = mcap.replace([np.inf, -np.inf], np.nan)
-    mc = mc.where(mc > 0)
+    mc = mcap.apply(pd.to_numeric, errors="coerce")
+    mc = mc.where(mc > 0)  # non-positive -> NaN
     return np.log(mc)
 
-
 def neutralize_sector(scores: pd.DataFrame, sector_df: pd.DataFrame) -> pd.DataFrame:
-    s = scores.stack(dropna=False).rename("s")
-    sec = sector_df.stack(dropna=False).rename("sec")
+    s = _stack(scores, "s")
+    sec = _stack(sector_df, "sec")
     df = pd.concat([s, sec], axis=1).dropna(subset=["s", "sec"])
 
     date = df.index.get_level_values(0)
-    g = df.groupby([date, "sec"])["s"]
+    g = df.groupby([date, "sec"], sort=False)["s"]
     df["s_sec"] = df["s"] - g.transform("mean")
 
     out = df["s_sec"].unstack()
     return out.reindex(index=scores.index, columns=scores.columns)
 
-
-def neutralize_lnmcap(scores: pd.DataFrame, lnmcap: pd.DataFrame) -> pd.DataFrame:
-    y = scores.stack(dropna=False).rename("y")
-    x = lnmcap.stack(dropna=False).rename("x")
-    df = pd.concat([y, x], axis=1).dropna()
-
-    date = df.index.get_level_values(0)
-    g = df.groupby(date)
-
-    x_bar = g["x"].transform("mean")
-    y_bar = g["y"].transform("mean")
-
-    xd = df["x"] - x_bar
-    yd = df["y"] - y_bar
-
-    num = (xd * yd).groupby(date).sum()
-    den = (xd * xd).groupby(date).sum().replace(0.0, np.nan)
-    b = num / den
-
-    b_row = date.map(b)
-    resid = yd - b_row * xd  # intercept already removed by demeaning
-
-    out = resid.unstack()
-    return out.reindex(index=scores.index, columns=scores.columns)
-
-
-def neutralize_sector_and_mcap(
+def neutralize_sector_and_mcap_fwl(
     scores: pd.DataFrame,
-    sector: pd.Series,            # ticker -> sector
-    mcap: pd.DataFrame,            # date×ticker (not logged)
-    universe_eligible: pd.DataFrame | None = None,
-    clip_lnmcap_q: float | None = 0.01,  # optional winsorize per date
+    sector: pd.Series,                # ticker -> sector
+    mcap: pd.DataFrame,               # date x ticker (NOT logged)
+    universe_eligible: Optional[pd.DataFrame] = None,
+    clip_lnmcap_q: Optional[float] = 0.01,
 ) -> pd.DataFrame:
     dates, tickers = scores.index, scores.columns
 
-    # Align everything once (critical)
+    # --- align inputs ---
+    y = scores.reindex(index=dates, columns=tickers)
     sec_df = sector_series_to_df(sector, dates, tickers)
-    mc = mcap.reindex(index=dates, columns=tickers)
-    lnmcap = to_log_mcap(mc)
+    lnmcap = to_log_mcap(mcap.reindex(index=dates, columns=tickers))
 
-    s = scores.reindex(index=dates, columns=tickers)
-
-    # Apply eligibility BEFORE neutralisation (recommended)
+    # --- apply eligibility BEFORE neutralization (recommended) ---
     if universe_eligible is not None:
-        elig = universe_eligible.reindex(index=dates, columns=tickers).fillna(False)
-        s = s.where(elig)
+        elig = universe_eligible.reindex(index=dates, columns=tickers).fillna(False).astype(bool)
+        y = y.where(elig)
         lnmcap = lnmcap.where(elig)
         sec_df = sec_df.where(elig)
 
-    # Optional: per-date winsorize ln(mcap) to reduce extreme influence
+    # --- optional winsorize ln(mcap) cross-sectionally per date ---
     if clip_lnmcap_q is not None and 0.0 < clip_lnmcap_q < 0.5:
         lo = lnmcap.quantile(clip_lnmcap_q, axis=1)
         hi = lnmcap.quantile(1.0 - clip_lnmcap_q, axis=1)
         lnmcap = lnmcap.clip(lower=lo, upper=hi, axis=0)
 
-    s1 = neutralize_sector(s, sec_df)
-    s2 = neutralize_lnmcap(s1, lnmcap)
-    return s2
+    # --- FWL step 1: residualize y by sector ---
+    y_tilde = neutralize_sector(y, sec_df)
+
+    # --- FWL step 2: residualize x by sector ---
+    x_tilde = neutralize_sector(lnmcap, sec_df)
+
+    # --- step 3: per-date regression y_tilde ~ x_tilde (no intercept after demeaning) ---
+    y_st = _stack(y_tilde, "y")
+    x_st = _stack(x_tilde, "x")
+    df = pd.concat([y_st, x_st], axis=1).dropna()
+
+    date = df.index.get_level_values(0)
+    g = df.groupby(date, sort=False)
+
+    # demean within date (removes intercept)
+    xd = df["x"] - g["x"].transform("mean")
+    yd = df["y"] - g["y"].transform("mean")
+
+    # beta(date) = sum(xd*yd)/sum(xd^2)
+    num = (xd * yd).groupby(date, sort=False).sum()
+    den = (xd * xd).groupby(date, sort=False).sum().replace(0.0, np.nan)
+    beta = num / den
+
+    # IMPORTANT FIX: do NOT use date.map(beta); use reindex + numpy
+    beta_row = beta.reindex(date).to_numpy(dtype=float)
+    resid = yd.to_numpy(dtype=float) - beta_row * xd.to_numpy(dtype=float)
+
+    out = pd.Series(resid, index=df.index, name="resid").unstack()
+    return out.reindex(index=dates, columns=tickers)
+
+
+def _stack(df: pd.DataFrame, name: str) -> pd.Series:
+    # pandas>=2.1: use future_stack=True, and do NOT pass dropna=
+    return df.stack(future_stack=True).rename(name)
+
