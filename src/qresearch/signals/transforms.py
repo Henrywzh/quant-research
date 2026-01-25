@@ -92,45 +92,40 @@ def neutralize_sector_and_mcap_fwl(
     sec_df = sector_series_to_df(sector, dates, tickers)
     lnmcap = to_log_mcap(mcap.reindex(index=dates, columns=tickers))
 
-    # --- apply eligibility BEFORE neutralization (recommended) ---
-    if universe_eligible is not None:
+    if universe_eligible is None:
+        elig = pd.DataFrame(True, index=dates, columns=tickers)
+    else:
         elig = universe_eligible.reindex(index=dates, columns=tickers).fillna(False).astype(bool)
-        y = y.where(elig)
-        lnmcap = lnmcap.where(elig)
-        sec_df = sec_df.where(elig)
 
-    # --- optional winsorize ln(mcap) cross-sectionally per date ---
+    # optional clip lnmcap (ok)
     if clip_lnmcap_q is not None and 0.0 < clip_lnmcap_q < 0.5:
         lo = lnmcap.quantile(clip_lnmcap_q, axis=1)
         hi = lnmcap.quantile(1.0 - clip_lnmcap_q, axis=1)
         lnmcap = lnmcap.clip(lower=lo, upper=hi, axis=0)
 
-    # --- FWL step 1: residualize y by sector ---
-    y_tilde = neutralize_sector(y, sec_df)
+    # IMPORTANT: enforce the final sample BEFORE neutralisation
+    mask = elig & y.notna() & lnmcap.notna() & sec_df.notna()
+    y = y.where(mask)
+    lnmcap = lnmcap.where(mask)
+    sec_df = sec_df.where(mask)
 
-    # --- FWL step 2: residualize x by sector ---
+    # sector residualize on the same sample
+    y_tilde = neutralize_sector(y, sec_df)
     x_tilde = neutralize_sector(lnmcap, sec_df)
 
-    # --- step 3: per-date regression y_tilde ~ x_tilde (no intercept after demeaning) ---
-    y_st = _stack(y_tilde, "y")
-    x_st = _stack(x_tilde, "x")
-    df = pd.concat([y_st, x_st], axis=1).dropna()
+    # stack (no dropna needed now if mask is correct, but harmless)
+    df = pd.concat([_stack(y_tilde, "y"), _stack(x_tilde, "x")], axis=1).dropna()
 
     date = df.index.get_level_values(0)
     g = df.groupby(date, sort=False)
 
-    # demean within date (removes intercept)
-    xd = df["x"] - g["x"].transform("mean")
-    yd = df["y"] - g["y"].transform("mean")
-
-    # beta(date) = sum(xd*yd)/sum(xd^2)
-    num = (xd * yd).groupby(date, sort=False).sum()
-    den = (xd * xd).groupby(date, sort=False).sum().replace(0.0, np.nan)
+    # No extra date demeaning needed (FWL already handled intercept via sector projection)
+    num = (df["x"] * df["y"]).groupby(date, sort=False).sum()
+    den = (df["x"] * df["x"]).groupby(date, sort=False).sum().replace(0.0, np.nan)
     beta = num / den
 
-    # IMPORTANT FIX: do NOT use date.map(beta); use reindex + numpy
     beta_row = beta.reindex(date).to_numpy(dtype=float)
-    resid = yd.to_numpy(dtype=float) - beta_row * xd.to_numpy(dtype=float)
+    resid = df["y"].to_numpy(dtype=float) - beta_row * df["x"].to_numpy(dtype=float)
 
     out = pd.Series(resid, index=df.index, name="resid").unstack()
     return out.reindex(index=dates, columns=tickers)
@@ -139,4 +134,3 @@ def neutralize_sector_and_mcap_fwl(
 def _stack(df: pd.DataFrame, name: str) -> pd.Series:
     # pandas>=2.1: use future_stack=True, and do NOT pass dropna=
     return df.stack(future_stack=True).rename(name)
-

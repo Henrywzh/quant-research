@@ -166,15 +166,11 @@ def sweep_signals(
     universe_eligible: Optional[pd.DataFrame] = None,
     benchmark_price: Optional[pd.DataFrame | pd.Series] = None,
     benchmark_name: str = "Benchmark",
-    # If True, keep a pointer to each rep (large). Default False.
-    keep_rep: bool = False,
-) -> pd.DataFrame:
-    """
-    Run a grid of (signal_name, params) tests using the SAME prebuilt universe_eligible.
-
-    This function does NOT build the universe; it only consumes it.
-    """
+    keep_rep: bool = True,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     rows = []
+    rep_map: Dict[str, Any] = {}
+
     for name, params in tests:
         out = run_signal_test(
             md=md,
@@ -188,7 +184,10 @@ def sweep_signals(
             mask_signal=False,
         )
 
+        key = _signal_key(out["signal_name"], out["signal_params"])
+
         row = {
+            "key": key,  # store key in df for easy joins
             "signal": out["signal_name"],
             "params": str(out["signal_params"]),
 
@@ -205,26 +204,25 @@ def sweep_signals(
             "ls_sharpe": out["ls_sharpe"],
             "ls_maxdd": out["ls_maxdd"],
 
-            # Diagnostics: helps you detect “good IC but tiny universe”
             "coverage_mean": out["coverage_mean"],
             "n_valid_mean": out["n_valid_mean"],
         }
+        rows.append(row)
 
         if keep_rep:
-            row["rep"] = out["rep"]
-
-        rows.append(row)
+            rep_map[key] = out["rep"]
 
     df = pd.DataFrame(rows)
 
-    # Suggested sort order for alpha discovery:
-    # 1) IC mean (persistent predictive power)
-    # 2) ICIR (stability)
-    # 3) monotonicity (sanity)
-    # 4) coverage (avoid small/unreliable universes)
     sort_cols = [c for c in ["ic_mean", "icir", "mono", "coverage_mean"] if c in df.columns]
-    if len(sort_cols):
-        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).reset_index(drop=True)
 
-    return df
+    return df, rep_map
+
+
+def _signal_key(name: str, params: dict) -> str:
+    items = ",".join(f"{k}={params[k]}" for k in sorted(params))
+    return f"{name}({items})"
+
 

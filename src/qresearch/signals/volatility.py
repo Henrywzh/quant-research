@@ -1,17 +1,17 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
-
+from .registry import register_signal
 from qresearch.data.types import MarketData
-from qresearch.signals.registry import register_signal
+from .helpers import _safe_div
 
-
-# Assumption: 3M ≈ 63 trading days (21 * 3). Override via lookback if desired.
 
 
 @register_signal(
     "vol_std_3M",
     description="3M volatility: rolling std of daily close-to-close returns over lookback (~63d).",
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("close",),
 )
 def vol_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -22,7 +22,7 @@ def vol_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFram
 @register_signal(
     "vol_highlow_avg_3M",
     description="3M intraday range level: rolling mean of (high/low) over lookback (~63d).",
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("high", "low"),
 )
 def vol_highlow_avg_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -33,7 +33,7 @@ def vol_highlow_avg_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.
 @register_signal(
     "vol_highlow_std_3M",
     description="3M intraday range dispersion: rolling std of (high/low) over lookback (~63d).",
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("high", "low"),
 )
 def vol_highlow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -46,7 +46,7 @@ def vol_highlow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.
     description=(
         "3M upper-shadow std (normalized): std of (high - max(open, close)) / high over lookback (~63d)."
     ),
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("open", "close", "high"),
 )
 def vol_upshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -60,7 +60,7 @@ def vol_upshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd
     description=(
         "3M lower-shadow std (normalized): std of (min(open, close) - low) / low over lookback (~63d)."
     ),
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("open", "close", "low"),
 )
 def vol_downshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -72,7 +72,7 @@ def vol_downshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> 
 @register_signal(
     "vol_w_upshadow_std_3M",
     description="3M Williams upper-shadow std: std of (high - close) / high over lookback (~63d).",
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("close", "high"),
 )
 def vol_w_upshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
@@ -83,14 +83,9 @@ def vol_w_upshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> 
 @register_signal(
     "vol_w_downshadow_std_3M",
     description="3M Williams lower-shadow std: std of (close - low) / low over lookback (~63d).",
-    defaults={"lookback": 63, "sign": 1},
+    defaults={"lookback": 63, "sign": -1},
     requires=("close", "low"),
 )
 def vol_w_downshadow_std_3M(md: MarketData, lookback: int = 63, sign: int = 1) -> pd.DataFrame:
     w_down = _safe_div(md.close - md.low, md.low).clip(lower=0.0)
     return sign * w_down.rolling(lookback).std()
-
-
-def _safe_div(numer: pd.DataFrame, denom: pd.DataFrame, eps: float = 1e-12) -> pd.DataFrame:
-    denom2 = denom.where(denom.abs() > eps, np.nan)
-    return numer / denom2

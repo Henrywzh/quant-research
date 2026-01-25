@@ -234,11 +234,19 @@ def load_estimated_shares(file_path: str | Path) -> pd.Series:
     else:
         raise ValueError("Unsupported file type. Use .csv or .parquet")
 
-    if "ticker" not in df.columns or "estimated_shares" not in df.columns:
+    if 'ticker' in df.columns:
+        ticker_col = 'ticker'
+    elif 'Ticker' in df.columns:
+        ticker_col = 'Ticker'
+    else:
         raise KeyError("Expected columns: ticker, estimated_shares")
 
-    s = df.set_index("ticker")["estimated_shares"].astype(float)
+    if "estimated_shares" not in df.columns:
+        raise KeyError("Expected columns: ticker, estimated_shares")
+
+    s = df.set_index(ticker_col)["estimated_shares"].astype(float)
     s.name = "estimated_shares"
+
     return s
 
 

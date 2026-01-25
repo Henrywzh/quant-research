@@ -12,6 +12,7 @@ from qresearch.backtest.metrics import (
     drawdown_series_from_equity,
     yearly_returns,
 )
+from qresearch.backtest.visualise import visualize_factor_tearsheet, FactorVizConfig
 from qresearch.data.types import MarketData
 
 
@@ -177,13 +178,17 @@ def make_tearsheet(
     - "worst bucket" = bucket_1
     - "LS" (factor) = best - worst
     """
+    visualise_cfg =  FactorVizConfig(
+        benchmark_name=benchmark_name,
+        best_col=f'bucket_{n_buckets}',
+        worst_col=f'bucket_1'
+    )
+
     if rolling_window_obs is None:
         # number of rebalance observations ~ 1 year
         rolling_window_obs = max(10, int(round(TRADING_DAYS / H)))
 
     # --- run backtest ---
-    close = md.close
-
     bucket_ret, bucket_lbl, ret_fwd = bucket_backtest(
         md=md,
         signal=signal,  # date x ticker, computed at close[t]
@@ -274,100 +279,19 @@ def make_tearsheet(
 
     # --- plotting ---
     if plot:
-        # 1) Cumulative IC + rolling IC
-        plt.figure()
-        ic.cumsum().plot()
-        plt.title("Cumulative IC (Spearman)")
-        plt.ylabel("Cumulative IC")
-        plt.xlabel("Date")
-        plt.tight_layout()
-        plt.show()
-
-        plt.figure()
-        ic_roll.plot()
-        plt.title(f"Rolling Mean IC (window={rolling_window_obs} obs)")
-        plt.ylabel("Rolling IC mean")
-        plt.xlabel("Date")
-        plt.tight_layout()
-        plt.show()
-
-        # 2) Bucket mean returns bar chart
-        plt.figure(figsize=(10, 6))
-        mean_by_bucket.sort_index(
-            key=lambda idx: idx.str.replace("bucket_", "", regex=False).astype(int)
-        ).plot(kind="bar")
-        plt.title("Mean Return per Bucket (per holding period)")
-        plt.ylabel("Mean H-day return")
-        plt.xlabel("Bucket (1=worst, N=best)")
-        plt.tight_layout()
-        plt.show()
-
-        # 3) Bucket cumulative curves (all buckets; can be busy but useful for diagnosis)
-        plt.figure()
-        eq_all = (1.0 + bucket_ret.fillna(0.0)).cumprod()
-        eq_all.plot(legend=True)
-        plt.title("Bucket Cumulative Curves")
-        plt.ylabel("Cumulative growth")
-        plt.xlabel("Date")
-        plt.tight_layout()
-        plt.show()
-
-        # 4) Drawdown plot: best vs worst vs benchmark (if any)
-        plt.figure()
-
-        dd_best = drawdown_series_from_equity(equity_curve(bucket_ret[best_col]))
-        dd_worst = drawdown_series_from_equity(equity_curve(bucket_ret[worst_col]))
-
-        if len(dd_best):
-            dd_best.plot(label=f"{best_col} (BEST, max_dd={dd_best.min():.2%})")
-        if len(dd_worst):
-            dd_worst.plot(label=f"{worst_col} (WORST, max_dd={dd_worst.min():.2%})")
-        if bench_dd is not None and len(bench_dd):
-            bench_dd.plot(label=f"{benchmark_name} (max_dd={bench_dd.min():.2%})")
-
-        plt.title("Drawdown Curves (Best / Worst / Benchmark)")
-        plt.ylabel("Drawdown")
-        plt.xlabel("Date")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        # 5) Long-short equity + drawdown (very high signal-to-noise diagnostic)
-        plt.figure()
-        ls_eq.plot()
-        plt.title("Long-Short Equity (Best - Worst)")
-        plt.ylabel("Equity")
-        plt.xlabel("Date")
-        plt.tight_layout()
-        plt.show()
-
-        plt.figure()
-        if len(ls_dd):
-            ls_dd.plot(label=f"LS (max_dd={ls_dd.min():.2%})")
-        plt.title("Long-Short Drawdown (Best - Worst)")
-        plt.ylabel("Drawdown")
-        plt.xlabel("Date")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-        # 6) Yearly returns bar: best/worst/benchmark/LS
-        yr_best = yearly_returns(bucket_ret[best_col]).rename(best_col)
-        yr_worst = yearly_returns(bucket_ret[worst_col]).rename(worst_col)
-
-        parts = [yr_best, yr_worst, ls_yearly]
-        if bench_yearly is not None and len(bench_yearly):
-            parts.append(bench_yearly)
-
-        yr_tbl = pd.concat(parts, axis=1).sort_index()
-        if len(yr_tbl):
-            plt.figure(figsize=(10, 5))
-            yr_tbl.plot(kind="bar")
-            plt.title("Calendar-Year Returns (Best / Worst / LS / Benchmark)")
-            plt.ylabel("Return")
-            plt.xlabel("Year")
-            plt.tight_layout()
-            plt.show()
+        visualize_factor_tearsheet(
+            ic=ic,
+            ic_roll=ic_roll,
+            bucket_ret=bucket_ret,
+            mean_by_bucket=mean_by_bucket,
+            ls_eq=ls_eq,
+            ls_dd=ls_dd,
+            ls_yearly=ls_yearly,
+            bench_eq=bench_eq if benchmark_price is not None else None,
+            bench_dd=bench_dd,
+            bench_yearly=bench_yearly,
+            cfg=visualise_cfg,
+        )
 
     # --- report dict ---
     return {
@@ -522,7 +446,6 @@ def _compute_benchmark_ret_fwd(
     if isinstance(bench_price, pd.Series):
         px_close = bench_price.sort_index()
         px_open = None
-
     else:
         bench_df = bench_price.sort_index()
 

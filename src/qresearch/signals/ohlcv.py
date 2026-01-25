@@ -2,8 +2,30 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+from .helpers import _rolling_vwap_from_ohlcv, _safe_div, _amount_proxy, _turnover_from_volume_and_shares, ts_rank, ref, \
+    rolling_corr, rolling_cov, cs_rank, ewma
 from .registry import register_signal
 from qresearch.data.types import MarketData
+
+
+@register_signal(
+    "size",
+    description="Size factor from market cap: sign * log(mkt_cap). Default sign=-1 gives SMALL-cap tilt.",
+    defaults={"sign": -1, "use_cs_rank": False},
+    requires=("mkt_cap",),  # you must attach md.mkt_cap (date x ticker) before running
+)
+def size(md: MarketData, sign: int = -1, use_cs_rank: bool = False) -> pd.DataFrame:
+    mkt = md.mkt_cap.astype(float)
+    logcap = np.log(mkt.where(mkt > 0))  # invalid/<=0 -> NaN
+
+    if use_cs_rank:
+        # cross-sectional rank per date in [0,1]
+        x = logcap.rank(axis=1, pct=True)
+    else:
+        x = logcap
+
+    return sign * x
 
 
 # tug of war
@@ -213,6 +235,243 @@ def trend_score_annret_r2(
     ann_ret = np.exp(b * ann_factor) - 1.0
     return ann_ret * r2
 
+
+# ---- 华西证券 ----
+@register_signal(
+    "vol_price_rank_cov",
+    description="5.1 Volume-Price rank covariance: -cs_rank( rolling_cov(ts_rank(close,w), ts_rank(volume,w), w) ).",
+    defaults={"window": 10, "outer_rank": True, "sign": 1},
+    requires=("close", "volume"),
+)
+def vol_price_rank_cov(md: MarketData, window: int = 10, outer_rank: bool = True, sign: int = 1) -> pd.DataFrame:
+    c_r = ts_rank(md.close, window)
+    v_r = ts_rank(md.volume, window)
+    cov = rolling_cov(c_r, v_r, window)
+    fac = -cov
+    if outer_rank:
+        fac = -cs_rank(cov)  # exactly: -rank{cov(...)}
+    return sign * fac
+
+
+@register_signal(
+    "vol_price_corr",
+    description="5.2 Volume-Price correlation: -rolling_corr(close, volume, window).",
+    defaults={"window": 20, "sign": 1},
+    requires=("close", "volume"),
+)
+def vol_price_corr(md: MarketData, window: int = 20, sign: int = 1) -> pd.DataFrame:
+    return sign * (-rolling_corr(md.close, md.volume, window))
+
+
+@register_signal(
+    "first_order_divergence",
+    description="5.3 First-order divergence: -Corr(ts_rank(vol/Ref(vol,1)-1,w), ts_rank(close/open-1,w), w).",
+    defaults={"window": 10, "sign": 1},
+    requires=("volume", "open", "close"),
+)
+def first_order_divergence(md: MarketData, window: int = 10, sign: int = 1) -> pd.DataFrame:
+    dv = md.volume / ref(md.volume, 1) - 1.0
+    r_oc = md.close / md.open - 1.0
+    x = ts_rank(dv, window)
+    y = ts_rank(r_oc, window)
+    return sign * (-rolling_corr(x, y, window))
+
+
+@register_signal(
+    "vol_amp_comove",
+    description="Volume-Amplitude co-movement: Corr(ts_rank(vol/Ref(vol,1)-1,w), ts_rank(high/low-1,w), w).",
+    defaults={"window": 10, "negate": False, "sign": 1},
+    requires=("volume", "high", "low"),
+)
+def vol_amp_comove(md: MarketData, window: int = 10, negate: bool = False, sign: int = 1) -> pd.DataFrame:
+    dv = md.volume / ref(md.volume, 1) - 1.0
+    amp = md.high / md.low - 1.0
+    x = ts_rank(dv, window)
+    y = ts_rank(amp, window)
+    corr = rolling_corr(x, y, window)
+    fac = -corr if negate else corr
+    return sign * fac
+
+
+@register_signal(
+    "mom_second_order",
+    description="Second-order momentum: EWMA(x - delay(x,window2), ewma_span), x=(close-mean(close,w1))/mean(close,w1).",
+    defaults={"window1": 20, "window2": 5, "ewma_span": 10, "sign": 1},
+    requires=("close",),
+)
+def mom_second_order(md: MarketData, window1: int = 20, window2: int = 5, ewma_span: int = 10, sign: int = 1) -> pd.DataFrame:
+    m = md.close.rolling(window1).mean()
+    x = _safe_div(md.close - m, m)
+    y = x - ref(x, window2)
+    return sign * ewma(y, ewma_span)
+
+
+@register_signal(
+    "mom_term_spread",
+    description="Momentum term spread: ret(window1) - ret(window2).",
+    defaults={"window1": 20, "window2": 60, "sign": 1},
+    requires=("close",),
+)
+def mom_term_spread(md: MarketData, window1: int = 20, window2: int = 60, sign: int = 1) -> pd.DataFrame:
+    c = md.close
+    r1 = c / ref(c, window1) - 1.0
+    r2 = c / ref(c, window2) - 1.0
+    return sign * (r1 - r2)
+
+
+@register_signal(
+    "amount_std",
+    description="Trading value volatility: -rolling_std(amount, window). If amount missing, use typical_price*volume.",
+    defaults={"window": 20, "use_proxy": True, "sign": 1},
+    requires=("high", "low", "close", "volume"),  # proxy needs these; if you truly have md.amount, you can change requires
+)
+def amount_std(md: MarketData, window: int = 20, use_proxy: bool = True, sign: int = 1) -> pd.DataFrame:
+    amt = md.amount if (hasattr(md, "amount") and md.amount is not None and not use_proxy) else _amount_proxy(md, lookback=window)
+    return sign * (-amt.rolling(window).std())
+
+
+@register_signal(
+    "volume_std",
+    description="Volume volatility: -rolling_std(volume, window).",
+    defaults={"window": 20, "sign": 1},
+    requires=("volume",),
+)
+def volume_std(md: MarketData, window: int = 20, sign: int = 1) -> pd.DataFrame:
+    return sign * (-md.volume.rolling(window).std())
+
+
+@register_signal(
+    "turnover_change",
+    description="Turnover change: mean(turnover,w1)/mean(turnover,w2). If turnover missing, use volume/shares_outstanding (lot_size adjustable).",
+    defaults={"window1": 20, "window2": 60, "lot_size": 1, "use_proxy": True, "sign": 1},
+    requires=("volume", "shares_outstanding"),
+)
+def turnover_change(
+    md: MarketData,
+    window1: int = 20,
+    window2: int = 60,
+    lot_size: int = 1,
+    use_proxy: bool = True,
+    sign: int = 1,
+) -> pd.DataFrame:
+    if hasattr(md, "turnover") and (md.turnover is not None) and (not use_proxy):
+        turn = md.turnover
+    else:
+        turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+    num = turn.rolling(window1).mean()
+    den = turn.rolling(window2).mean()
+    return sign * _safe_div(num, den)
+
+
+@register_signal(
+    "bull_bear_total",
+    description="Bull-bear total: -rolling_sum((close-low)/(high-close), window).",
+    defaults={"window": 20, "sign": 1},
+    requires=("high", "low", "close"),
+)
+def bull_bear_total(md: MarketData, window: int = 20, sign: int = 1) -> pd.DataFrame:
+    num = md.close - md.low
+    den = md.high - md.close
+    ratio = _safe_div(num, den)
+    return sign * (-(ratio.rolling(window).sum()))
+
+
+@register_signal(
+    "bull_bear_change",
+    description="Bull-bear change: EWMA(z,w1) - EWMA(z,w2), z=vol*((close-low)-(high-close))/(high-low).",
+    defaults={"window1": 10, "window2": 30, "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def bull_bear_change(md: MarketData, window1: int = 10, window2: int = 30, sign: int = 1) -> pd.DataFrame:
+    z_num = (md.close - md.low) - (md.high - md.close)   # = 2*close - high - low
+    z_den = md.high - md.low
+    z = md.volume * _safe_div(z_num, z_den)
+    return sign * (ewma(z, window1) - ewma(z, window2))
+
+
+
+# ---- Liquidity ----
+
+@register_signal(
+    "liq_turn_avg_3M",
+    description="3M turnover mean: mean(volume/shares_outstanding) over lookback (~63d).",
+    defaults={"lookback": 63, "lot_size": 1, "sign": 1},
+    requires=("volume", "shares_outstanding"),
+)
+def liq_turn_avg_3M(md: MarketData, lookback: int = 63, lot_size: int = 1, sign: int = 1) -> pd.DataFrame:
+    turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+    return sign * turn.rolling(lookback).mean()
+
+
+@register_signal(
+    "liq_turn_std_3M",
+    description="3M turnover std: std(volume/shares_outstanding) over lookback (~63d).",
+    defaults={"lookback": 63, "lot_size": 1, "sign": 1},
+    requires=("volume", "shares_outstanding"),
+)
+def liq_turn_std_3M(md: MarketData, lookback: int = 63, lot_size: int = 1, sign: int = 1) -> pd.DataFrame:
+    turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+    return sign * turn.rolling(lookback).std()
+
+
+@register_signal(
+    "liq_vstd_3M",
+    description="3M volume-vol ratio: mean(value_traded_proxy) / std(daily returns). value≈price_proxy*volume.",
+    defaults={"lookback": 63, "amount_mode": "tp", "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def liq_vstd_3M(
+    md: MarketData,
+    lookback: int = 63,
+    amount_mode: str = "tp",
+    sign: int = 1,
+) -> pd.DataFrame:
+    amt = _amount_proxy(md, lookback=lookback, mode=amount_mode)
+    r = md.close.pct_change()
+    return sign * _safe_div(amt.rolling(lookback).mean(), r.rolling(lookback).std())
+
+
+@register_signal(
+    "liq_amihud_avg_3M",
+    description="3M Amihud illiquidity mean: mean(|ret|/value_traded_proxy) over lookback. value≈price_proxy*volume.",
+    defaults={"lookback": 63, "amount_mode": "tp", "use_abs": True, "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def liq_amihud_avg_3M(
+    md: MarketData,
+    lookback: int = 63,
+    amount_mode: str = "tp",
+    use_abs: bool = True,
+    sign: int = 1,
+) -> pd.DataFrame:
+    amt = _amount_proxy(md, lookback=lookback, mode=amount_mode)
+    r = md.close.pct_change()
+    r = r.abs() if use_abs else r
+    illiq = _safe_div(r, amt)
+    return sign * illiq.rolling(lookback).mean()
+
+
+@register_signal(
+    "liq_amihud_std_3M",
+    description="3M Amihud illiquidity std: std(|ret|/value_traded_proxy) over lookback. value≈price_proxy*volume.",
+    defaults={"lookback": 63, "amount_mode": "tp", "use_abs": True, "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def liq_amihud_std_3M(
+    md: MarketData,
+    lookback: int = 63,
+    amount_mode: str = "tp",
+    use_abs: bool = True,
+    sign: int = 1,
+) -> pd.DataFrame:
+    amt = _amount_proxy(md, lookback=lookback, mode=amount_mode)
+    r = md.close.pct_change(fill_method=None)
+    r = r.abs() if use_abs else r
+    illiq = _safe_div(r, amt)
+    return sign * illiq.rolling(lookback).std()
+
+
+# ---- WEIRD ----
 
 @register_signal(
     "fourline_open_score",
@@ -430,3 +689,100 @@ def fourline_open_score(
 
     # default: score
     return score
+
+
+# ---------- Factor 1: VWAP deviation * volume ratio * price momentum (OHLCV version) ----------
+
+@register_signal(
+    "vwap_dev_x_volratio_x_mom",
+    description=(
+        "OHLCV-only version of: (avg(amount/volume,10)/close-1) * (vol/avg(vol,20)) * (close/avg(close,20)-1). "
+        "Replace avg(amount/volume,10) with rolling VWAP proxy using typical price."
+    ),
+    defaults={"vwap_window": 10, "vol_window": 20, "mom_window": 20, "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def vwap_dev_x_volratio_x_mom(
+    md: "MarketData",
+    vwap_window: int = 10,
+    vol_window: int = 20,
+    mom_window: int = 20,
+    sign: int = 1,
+) -> pd.DataFrame:
+    vwap_n = _rolling_vwap_from_ohlcv(md, vwap_window)
+    vwap_dev = _safe_div(vwap_n, md.close) - 1.0
+
+    vol_ma = md.volume.rolling(vol_window).mean()
+    vol_ratio = _safe_div(md.volume, vol_ma)
+
+    mom_ma = md.close.rolling(mom_window).mean()
+    price_mom = _safe_div(md.close, mom_ma) - 1.0
+
+    factor = vwap_dev * vol_ratio * price_mom
+    return sign * factor
+
+
+# ---------- Factor 2.1: Volume-Price Combination (binary) ----------
+
+@register_signal(
+    "vol_price_combination",
+    description="(vol > 1.5*MA(vol,20)) AND (close > VWAP_proxy_20). Returns 0/1.",
+    defaults={"vol_window": 20, "vwap_window": 20, "vol_mult": 1.5, "sign": 1},
+    requires=("high", "low", "close", "volume"),
+)
+def vol_price_combination(
+    md: "MarketData",
+    vol_window: int = 20,
+    vwap_window: int = 20,
+    vol_mult: float = 1.5,
+    sign: int = 1,
+) -> pd.DataFrame:
+    vwap_n = _rolling_vwap_from_ohlcv(md, vwap_window)
+    vol_ma = md.volume.rolling(vol_window).mean()
+
+    cond = (md.volume > vol_mult * vol_ma) & (md.close > vwap_n)
+    out = cond.astype(float)
+    return sign * out
+
+
+# ---------- Factor 2.2: Volume Breakout (binary) ----------
+
+@register_signal(
+    "volume_breakout",
+    description=(
+        "(vol > 1.5*MA(vol,60)) AND (close > HHV(high,60)). "
+        "Optional confirm: vol > 1.2*MA(vol,5) lagged by 1 day. Returns 0/1."
+    ),
+    defaults={
+        "vol_window": 60,
+        "hhv_window": 60,
+        "vol_mult": 1.5,
+        "use_confirm": True,
+        "confirm_window": 5,
+        "confirm_mult": 1.2,
+        "sign": 1,
+    },
+    requires=("high", "close", "volume"),
+)
+def volume_breakout(
+    md: "MarketData",
+    vol_window: int = 60,
+    hhv_window: int = 60,
+    vol_mult: float = 1.5,
+    use_confirm: bool = True,
+    confirm_window: int = 5,
+    confirm_mult: float = 1.2,
+    sign: int = 1,
+) -> pd.DataFrame:
+    vol_ma = md.volume.rolling(vol_window).mean()
+    hhv = md.high.rolling(hhv_window).max()
+
+    cond = (md.volume > vol_mult * vol_ma) & (md.close > hhv)
+
+    if use_confirm:
+        # Use lagged MA to avoid diluting the threshold with today's spike
+        v5 = md.volume.rolling(confirm_window).mean().shift(1)
+        cond = cond & (md.volume > confirm_mult * v5)
+
+    out = cond.astype(float)
+    return sign * out
