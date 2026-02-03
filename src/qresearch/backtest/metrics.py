@@ -86,6 +86,11 @@ def drawdown_series_from_equity(eq: pd.Series) -> pd.Series:
     return eq / peak - 1.0
 
 
+def equity_curve(ret: pd.Series) -> pd.Series:
+    ret = ret.fillna(0.0)
+    return (1.0 + ret).cumprod()
+
+
 def max_drawdown_from_returns(r: pd.Series) -> float:
     r = r.fillna(0.0)
     eq = (1.0 + r).cumprod()

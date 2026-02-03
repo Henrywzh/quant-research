@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Literal
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 from qresearch.backtest.metrics import (
     TRADING_DAYS,
@@ -12,11 +11,9 @@ from qresearch.backtest.metrics import (
     drawdown_series_from_equity,
     yearly_returns,
 )
+from qresearch.backtest.config import EntryMode
 from qresearch.backtest.visualise import visualize_factor_tearsheet, FactorVizConfig
 from qresearch.data.types import MarketData
-
-
-EntryMode = Literal["next_close", "next_open", "open_to_close"]
 
 
 def bucket_backtest(

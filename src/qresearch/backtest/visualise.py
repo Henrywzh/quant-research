@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from qresearch.backtest.metrics import drawdown_series_from_equity, equity_curve, yearly_returns
+
 
 @dataclass
 class FactorVizConfig:
@@ -119,16 +121,6 @@ def visualize_factor_tearsheet(
     plt.show()
 
     # -------- 4) Drawdown plot: best vs worst vs benchmark --------
-    def equity_curve(ret: pd.Series) -> pd.Series:
-        ret = ret.fillna(0.0)
-        return (1.0 + ret).cumprod()
-
-    def drawdown_series_from_equity(eq: pd.Series) -> pd.Series:
-        if eq is None or len(eq) == 0:
-            return eq
-        peak = eq.cummax()
-        return eq / peak - 1.0
-
     plt.figure(figsize=cfg.figsize)
 
     dd_best = drawdown_series_from_equity(equity_curve(bucket_ret[best_col]))
@@ -183,14 +175,6 @@ def visualize_factor_tearsheet(
         plt.show()
 
     # -------- 6) Yearly returns bar --------
-    def yearly_returns(ret: pd.Series) -> pd.Series:
-        ret = ret.dropna()
-        if len(ret) == 0:
-            return pd.Series(dtype=float)
-        ret.index = pd.to_datetime(ret.index)
-        # calendar-year compounded return
-        return (1.0 + ret).groupby(ret.index.year).prod() - 1.0
-
     yr_best = yearly_returns(bucket_ret[best_col]).rename(best_col)
     yr_worst = yearly_returns(bucket_ret[worst_col]).rename(worst_col)
 
