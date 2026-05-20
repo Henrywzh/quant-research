@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Literal, Tuple, Optional
 import numpy as np
 import pandas as pd
@@ -24,6 +24,23 @@ class PortfolioBacktestResult:
     exposure: pd.Series          # now = GROSS exposure = sum(|w_used|)
     cash_weight: pd.Series       # residual cash = max(0, 1-gross_exposure)
     weights_used: pd.DataFrame
+
+
+def _slice_market_data(md: MarketData, start: pd.Timestamp, end: pd.Timestamp | None) -> MarketData:
+    close_df = md.close.sort_index().loc[start:end]
+    cols = close_df.columns
+    data: dict[str, pd.DataFrame | None] = {"close": close_df}
+
+    for f in fields(md):
+        if f.name == "close":
+            continue
+        value = getattr(md, f.name)
+        if value is None:
+            data[f.name] = None
+            continue
+        data[f.name] = value.sort_index().reindex(index=close_df.index, columns=cols)
+
+    return MarketData(**data)
 
 
 def backtest_weights(
@@ -134,15 +151,8 @@ def run_one(
 ) -> dict:
     start = pd.to_datetime(cfg.start)
     end = pd.to_datetime(cfg.end) if cfg.end is not None else None
-
-    close_df = md.close.sort_index().loc[start:end]
-    open_df = None
-    if getattr(md, "open", None) is not None:
-        open_df = md.open.sort_index().reindex(index=close_df.index, columns=close_df.columns)
-
-    md_s = md
-    md_s.close = close_df
-    md_s.open = open_df
+    md_s = _slice_market_data(md, start, end)
+    close_df = md_s.close
 
     scores = scores.sort_index().reindex(index=close_df.index, columns=close_df.columns)
 
@@ -243,4 +253,3 @@ def plot_compare(strat: PortfolioBacktestResult, bench: PortfolioBacktestResult,
     ax.set_xlabel("Year")
     fig.tight_layout()
     plt.show()
-

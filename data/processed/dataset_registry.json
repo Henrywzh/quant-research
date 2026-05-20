@@ -1,0 +1,82 @@
+{
+  "datasets": {
+    "ashare_connect_codes": {
+      "format": "parquet",
+      "path": "jqdata/ashare_connect_codes_2016_2025.parquet",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "jqdata",
+      "upstream_raw_inputs": [
+        "raw/jqdata/ashare_connect_codes_2016_2025.csv"
+      ]
+    },
+    "ashare_connect_events": {
+      "format": "parquet",
+      "path": "jqdata/ashare_connect_events_2016_2025.parquet",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "jqdata",
+      "upstream_raw_inputs": [
+        "raw/jqdata/ashare_connect_events_2016_2025.csv"
+      ]
+    },
+    "hsci_components_history": {
+      "format": "csv",
+      "path": "hsci_components_history.csv",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "hkex_history_parse",
+      "upstream_raw_inputs": [
+        "raw/history_hsci.xlsx"
+      ]
+    },
+    "hsci_ohlc": {
+      "format": "parquet",
+      "path": "market/hsci_ohlc.parquet",
+      "schema_version": 1,
+      "source_quality": "exploratory",
+      "source_system": "yahoo_finance",
+      "upstream_raw_inputs": []
+    },
+    "hsci_ticker_master": {
+      "format": "csv",
+      "path": "hsci_ticker_master.csv",
+      "schema_version": 2,
+      "source_quality": "canonical",
+      "source_system": "hsci_membership_builder",
+      "upstream_raw_inputs": [
+        "processed/hsci_components_history.csv",
+        "raw/hsci_components_2008.csv",
+        "processed/hsci_components.csv"
+      ]
+    },
+    "industry_map": {
+      "format": "csv",
+      "path": "jqdata/industry_map.csv",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "jqdata",
+      "upstream_raw_inputs": []
+    },
+    "jq_limit_daily_with_open": {
+      "format": "parquet",
+      "path": "jqdata/limit_daily_2016_2025_with_open.parquet",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "jqdata",
+      "upstream_raw_inputs": [
+        "raw/jqdata/limit_daily_2016.csv"
+      ]
+    },
+    "jq_prices_panel": {
+      "format": "parquet",
+      "path": "jqdata/jq_prices_panel_2016_2025.parquet",
+      "schema_version": 1,
+      "source_quality": "canonical",
+      "source_system": "jqdata",
+      "upstream_raw_inputs": [
+        "raw/jqdata/prices_2016.csv"
+      ]
+    }
+  }
+}

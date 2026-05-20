@@ -1,10 +1,13 @@
-from typing import Optional
+from typing import Optional, Dict, Literal
 
 import numpy as np
 import pandas as pd
 import re
 from openpyxl import load_workbook
 from pathlib import Path
+
+from qresearch.data.catalog import load_dataset_metadata, resolve_dataset_path
+from qresearch.data.jqdata import build_jq_panel_parquet
 from qresearch.data.types import MarketData
 from qresearch.data.utils import get_raw_dir, get_processed_dir
 
@@ -21,45 +24,52 @@ GROUP_COL_CANDIDATES = [
 ID_COL = "Stock Code 股份代號"  # used to identify real data rows
 
 
-def save_market_data_to_parquet(md: MarketData, file_path: Path | str) -> None:
+def marketdata_to_panel(md: MarketData) -> pd.DataFrame:
     """
-    Save MarketData as a single Parquet file in yfinance-style MultiIndex columns:
-      level0 = Field (Close/Open/High/Low/Volume)
-      level1 = Ticker
-    Includes only fields that exist (not None).
+    Convert MarketData into the canonical wide panel format.
+
+    Layout:
+      - index: DatetimeIndex
+      - columns: MultiIndex (Field, Ticker)
     """
-    parts = {"Close": md.close}
-    if md.open is not None:   parts["Open"] = md.open
-    if md.high is not None:   parts["High"] = md.high
-    if md.low is not None:    parts["Low"] = md.low
-    if md.volume is not None: parts["Volume"] = md.volume
+    parts: dict[str, pd.DataFrame] = {"Close": md.close}
+    if md.open is not None:
+        parts["Open"] = md.open
+    if md.high is not None:
+        parts["High"] = md.high
+    if md.low is not None:
+        parts["Low"] = md.low
+    if md.volume is not None:
+        parts["Volume"] = md.volume
+    if md.turnover is not None:
+        parts["Turnover"] = md.turnover
 
     panel = pd.concat(parts, axis=1).sort_index(axis=1)
-
-    file_path = Path(file_path)
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-
-    panel.to_parquet(file_path)  # requires pyarrow or fastparquet installed
-
-def load_market_data_from_parquet(file_path: Path | str) -> MarketData:
-    """
-    Load a yfinance-style MultiIndex Parquet back into MarketData.
-    Missing fields become None.
-    """
-    file_path = Path(file_path)
-    panel = pd.read_parquet(file_path)
-
-    # Ensure DatetimeIndex (parquet sometimes returns object index if saved oddly)
     if not isinstance(panel.index, pd.DatetimeIndex):
         panel.index = pd.to_datetime(panel.index)
+    panel.index = panel.index.sort_values()
+    panel = panel.sort_index()
+    return panel
 
-    # Expect MultiIndex columns: (Field, Ticker)
+
+def panel_to_marketdata(panel: pd.DataFrame) -> MarketData:
+    """
+    Convert a canonical wide panel into MarketData.
+    """
+    if not isinstance(panel.index, pd.DatetimeIndex):
+        panel = panel.copy()
+        panel.index = pd.to_datetime(panel.index)
     if not isinstance(panel.columns, pd.MultiIndex) or panel.columns.nlevels != 2:
-        raise ValueError("Parquet must contain MultiIndex columns (Field, Ticker).")
+        raise ValueError("Panel must contain MultiIndex columns (Field, Ticker).")
+
+    panel = panel.sort_index().sort_index(axis=1)
+    inferred_freq = pd.infer_freq(panel.index) if len(panel.index) >= 3 else None
+    if inferred_freq is not None:
+        panel.index.freq = inferred_freq
 
     lvl0 = panel.columns.get_level_values(0)
 
-    def _get(field: str):
+    def _get(field: str) -> pd.DataFrame | None:
         return panel[field].copy() if field in lvl0 else None
 
     return MarketData(
@@ -68,7 +78,228 @@ def load_market_data_from_parquet(file_path: Path | str) -> MarketData:
         high=_get("High"),
         low=_get("Low"),
         volume=_get("Volume"),
+        turnover=_get("Turnover"),
     )
+
+
+def save_market_data_to_parquet(md: MarketData, file_path: Path | str) -> None:
+    """
+    Save MarketData as a single Parquet file in yfinance-style MultiIndex columns:
+      level0 = Field (Close/Open/High/Low/Volume)
+      level1 = Ticker
+    Includes only fields that exist (not None).
+    """
+    panel = marketdata_to_panel(md)
+
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    panel.to_parquet(file_path)  # requires pyarrow or fastparquet installed
+
+
+def _resolve_artifact_path(file_path: Path | str, *, root: Path | str | None = None) -> Path:
+    path = Path(file_path)
+    if path.exists():
+        return path
+    if path.suffix:
+        return path
+    return resolve_dataset_path(str(file_path), root=root)
+
+
+def load_market_data_from_parquet(file_path: Path | str, *, root: Path | str | None = None) -> MarketData:
+    """
+    Load a **canonical MarketData panel** from a Parquet file.
+
+    Expected Parquet layout (wide "panel" format):
+      - index: DatetimeIndex of trading dates (daily frequency)
+      - columns: MultiIndex with exactly 2 levels:
+          level 0 = Field name (e.g., "Open", "Close", "High", "Low", "Volume", "Turnover")
+          level 1 = Ticker / instrument identifier (e.g., "600519.XSHG")
+
+    This format is intentionally compatible with a "yfinance-style" panel, but is used as
+    the internal canonical storage for *any* data source (yfinance / JoinQuant / etc.).
+
+    Behavior:
+      - If the index is not a DatetimeIndex, it is coerced via pd.to_datetime.
+      - Missing fields are returned as None in the MarketData object.
+      - No alignment, forward-filling, or corporate-action adjustments are applied here.
+        Those should be handled upstream (data processing) or downstream (research logic).
+    """
+    file_path = _resolve_artifact_path(file_path, root=root)
+    panel = pd.read_parquet(file_path)
+
+    return panel_to_marketdata(panel)
+
+
+def save_market_data_to_csv(md: MarketData, file_path: Path | str) -> None:
+    """
+    Save MarketData to CSV using the same canonical panel format as parquet storage.
+    """
+    panel = marketdata_to_panel(md)
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    panel.to_csv(file_path)
+
+
+def load_market_data_from_csv(file_path: Path | str, *, root: Path | str | None = None) -> MarketData:
+    """
+    Load MarketData from a CSV saved in the canonical panel format.
+    """
+    resolved = _resolve_artifact_path(file_path, root=root)
+    panel = pd.read_csv(resolved, header=[0, 1], index_col=0, parse_dates=True)
+    return panel_to_marketdata(panel)
+
+
+def load_market_data_with_metadata(
+    file_path: Path | str,
+    *,
+    root: Path | str | None = None,
+) -> tuple[MarketData, object | None]:
+    resolved = _resolve_artifact_path(file_path, root=root)
+    suffix = resolved.suffix.lower()
+    if suffix == ".parquet":
+        md = load_market_data_from_parquet(resolved, root=root)
+    elif suffix == ".csv":
+        md = load_market_data_from_csv(resolved, root=root)
+    else:
+        raise ValueError(f"Unsupported market-data artifact type: {resolved.suffix}")
+    metadata = load_dataset_metadata(resolved, root=root)
+    return md, metadata
+
+
+def load_limit_daily_with_open(
+    *,
+    file_path: Path | str,
+    dates: pd.DatetimeIndex,
+    tickers: pd.Index,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Load processed limit_daily parquet (already contains 'open') and pivot into matrices:
+      open, close, volume, high_limit, low_limit
+
+    Returns matrices aligned to (dates x tickers).
+    """
+    file_path = Path(file_path)
+    df = pd.read_parquet(file_path)
+
+    # normalize keys
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df["code"] = df["code"].astype("string").str.strip()
+
+    # keep only needed cols (safe if extras exist)
+    keep = ["date", "code", "open", "close", "volume", "high_limit", "low_limit"]
+    missing = [c for c in keep if c not in df.columns]
+    if missing:
+        raise ValueError(f"{file_path.name} missing columns: {missing}. Got: {list(df.columns)}")
+
+    out = {
+        "open": long_to_matrix(df, date_col="date", code_col="code", value_col="open", dates=dates, tickers=tickers),
+        "close": long_to_matrix(df, date_col="date", code_col="code", value_col="close", dates=dates, tickers=tickers),
+        "volume": long_to_matrix(df, date_col="date", code_col="code", value_col="volume", dates=dates, tickers=tickers),
+        "high_limit": long_to_matrix(df, date_col="date", code_col="code", value_col="high_limit", dates=dates, tickers=tickers),
+        "low_limit": long_to_matrix(df, date_col="date", code_col="code", value_col="low_limit", dates=dates, tickers=tickers),
+    }
+    return out
+
+
+def load_jq_market_data(
+    jq_prices_parquet: Path | str,
+    panel_cache_path: Path | str,
+) -> "MarketData":
+    panel_cache_path = Path(panel_cache_path)
+
+    if not panel_cache_path.exists():
+        build_jq_panel_parquet(
+            jq_prices_parquet=jq_prices_parquet,
+            out_panel_parquet=panel_cache_path,
+        )
+
+    return load_market_data_from_parquet(panel_cache_path)
+
+
+# 你可以在这里扩展/改别名：用“人类可读名称”来选用哪套行业口径
+SECTOR_MAP_ALIASES = {
+    # 申万
+    "sw一级": "sw_l1",
+    "sw1": "sw_l1",
+    "申万一级": "sw_l1",
+    "sw二级": "sw_l2",
+    "sw2": "sw_l2",
+    "申万二级": "sw_l2",
+    "sw三级": "sw_l3",
+    "sw3": "sw_l3",
+    "申万三级": "sw_l3",
+
+    # 聚宽
+    "jq一级": "jq_l1",
+    "聚宽一级": "jq_l1",
+    "jq二级": "jq_l2",
+    "聚宽二级": "jq_l2",
+
+    # 证监会
+    "证监会": "zjw",
+    "zjw": "zjw",
+}
+
+def load_sector_mapper(
+    csv_path: str = get_processed_dir() / 'jqdata' / 'industry_map.csv',
+    taxonomy: str = '申万一级',
+    *,
+    code_col: str = "stock_code",
+    prefer: Literal["name", "code"] = "name",
+    return_series: bool = True,
+    dropna: bool = True,
+) -> "Dict[str, str] | pd.Series":
+    """
+    从本地行业映射 CSV 里，构建一个 {stock_code -> sector_name} 的映射（或返回 Series）。
+
+    约定：你的 CSV 是“flatten 过”的形式，至少包含：
+      - stock_code
+      - <tax>_name / <tax>_code  （例如 sw_l1_name, sw_l1_code）
+
+    参数
+    - taxonomy: 用名称选择行业口径（例如 "sw一级", "申万二级", "jq一级", "证监会"）
+    - prefer: 默认返回 name（行业中文名）；也可以选 "code"
+    - return_series: True 则返回 pd.Series（index=stock_code, value=sector）
+    - dropna: True 则丢掉 sector 为空的行
+
+    返回
+    - dict: { '000001.XSHE': '银行', ... }  或  Series
+    """
+    tax_key = SECTOR_MAP_ALIASES.get(taxonomy.strip().lower(), None)
+    if tax_key is None:
+        # 也允许你直接传 sw_l1/jq_l2 这种“内部key”
+        tax_key = taxonomy.strip()
+
+    df = pd.read_csv(csv_path)
+
+    # 自动识别列名（兼容你可能还没改名的情况）
+    # 期望：sw_l1_name / sw_l1_code 这种
+    want_col = f"{tax_key}_{prefer}"
+    if want_col not in df.columns:
+        # 兼容旧命名：sw_l1_industry_name / sw_l1_industry_code
+        alt = f"{tax_key}_industry_{prefer}"
+        if alt in df.columns:
+            want_col = alt
+        else:
+            raise KeyError(
+                f"找不到行业列：期望 {tax_key}_{prefer} 或 {tax_key}_industry_{prefer}，"
+                f"但实际列为：{list(df.columns)}"
+            )
+
+    if code_col not in df.columns:
+        raise KeyError(f"找不到股票代码列 {code_col}，实际列为：{list(df.columns)}")
+
+    out = df[[code_col, want_col]].copy()
+    out = out.drop_duplicates(subset=[code_col], keep="last")
+    if dropna:
+        out = out[out[want_col].notna() & (out[want_col].astype(str).str.len() > 0)]
+
+    s = pd.Series(out[want_col].values, index=out[code_col].values, name=want_col)
+
+    return s if return_series else s.to_dict()
+
 
 def save_historical_mcap_parquet(
     mcap: pd.DataFrame,
@@ -413,3 +644,22 @@ def _extract_sector_from_a2(path: str, sheet_name: str) -> str | None:
     v = str(v).strip()
     m = SECTOR_RE.search(v)
     return m.group(1).strip() if m else None
+
+
+def long_to_matrix(
+    df: pd.DataFrame,
+    *,
+    date_col: str,
+    code_col: str,
+    value_col: str,
+    dates: pd.DatetimeIndex,
+    tickers: pd.Index,
+) -> pd.DataFrame:
+    x = df[[date_col, code_col, value_col]].copy()
+    x[date_col] = pd.to_datetime(x[date_col], errors="coerce").dt.normalize()
+    x[code_col] = x[code_col].astype("string").str.strip()
+    x = x.dropna(subset=[date_col, code_col])
+
+    mat = x.pivot(index=date_col, columns=code_col, values=value_col)
+    # Align to the canonical grid
+    return mat.reindex(index=dates, columns=tickers)

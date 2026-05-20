@@ -1,0 +1,4 @@
+from .config import DEFAULT_ISSUERS, DEFAULT_LANGUAGE
+
+__all__ = ["DEFAULT_ISSUERS", "DEFAULT_LANGUAGE"]
+

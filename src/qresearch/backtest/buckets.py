@@ -17,13 +17,14 @@ from qresearch.data.types import MarketData
 
 
 def bucket_backtest(
-    md: MarketData,
+    md: "MarketData",
     signal: pd.DataFrame,
     H: int = 1,
     n_buckets: int = 10,
-    entry_mode: EntryMode = "next_close",
+    entry_mode: "EntryMode" = "next_close",
     universe_eligible: Optional[pd.DataFrame] = None,
     *,
+    exec_masks: Optional[Dict[str, pd.DataFrame]] = None,
     ffill_labels: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -60,11 +61,10 @@ def bucket_backtest(
 
     Notes:
     - Uses a small epsilon tie-breaker to stabilize bucketing for discrete or tied signals.
-    - Uses pd.qcut on ranks to produce near-equal-count buckets; falls back to arithmetic binning if qcut fails.
+    - Uses NumPy quantile binning for near-equal-count buckets (much faster than pd.qcut).
     - If ffill_labels=True, bucket_lbl is forward-filled for up to H-1 days to represent "held membership".
       Keep this OFF unless you explicitly need held-period labels; it can be misinterpreted as formation labels.
     """
-
     close = md.close.sort_index()
     signal = signal.reindex(index=close.index, columns=close.columns)
 
@@ -103,6 +103,19 @@ def bucket_backtest(
             .astype(bool)
         )
 
+    # ---- prep execution feasibility masks (aligned) ----
+    close_em = None
+    if exec_masks is not None:
+        needed = {"tradeable", "limit_up_locked", "limit_down_locked", "can_buy_next_open", "can_sell_next_open"}
+        missing = needed - set(exec_masks.keys())
+        if missing:
+            raise ValueError(f"exec_masks missing keys: {sorted(missing)}")
+        exec_masks = {k: _align_bool(v, close) for k, v in exec_masks.items()}
+
+        # Precompute close-execution masks ONCE (big speedup)
+        close_em = _make_close_exec_masks(exec_masks)
+        close_em = {k: _align_bool(v, close) for k, v in close_em.items()}
+
     for t in rebalance_dates:
         sig_t = signal.loc[t]
         ret_t = ret_fwd.loc[t]
@@ -110,6 +123,20 @@ def bucket_backtest(
         valid_mask = sig_t.notna() & ret_t.notna()
         if universe_eligible is not None:
             valid_mask &= universe_eligible.loc[t].fillna(False).astype(bool)
+
+        # --- Step 5-lite: enforce entry and exit feasibility consistent with entry_mode ---
+        if exec_masks is not None:
+            feasible = _execution_feasible_mask_for_bucket(
+                entry_mode=entry_mode,
+                dates=dates,
+                t=t,
+                H=H,
+                exec_masks=exec_masks,
+                close_em=close_em,
+            )
+            feasible = feasible.reindex(close.columns).fillna(False).astype(bool)
+            valid_mask &= feasible
+        # -------------------------------------------------------------------------------
 
         if valid_mask.sum() < n_buckets:
             continue
@@ -120,17 +147,8 @@ def bucket_backtest(
         eps = pd.Series(np.arange(len(sig_valid), dtype=float), index=sig_valid.index) * 1e-12
         sig_valid = sig_valid + eps
 
-        # stable equal-count buckets (1..n, where 1=worst)
-        ranks = sig_valid.rank(ascending=True, method="first")
-        try:
-            bucket_ids = pd.qcut(ranks, q=n_buckets, labels=range(1, n_buckets + 1))
-            bucket_ids = bucket_ids.astype(int)
-        except ValueError:
-            # fallback to your original sizing if qcut fails
-            n_valid = len(sig_valid)
-            bucket_size = n_valid / n_buckets
-            bucket_ids = ((ranks - 1) / bucket_size).astype(int) + 1
-            bucket_ids = bucket_ids.clip(1, n_buckets).astype(int)
+        # fast near-equal-count buckets (1..n, where 1=worst)
+        bucket_ids = _bucketize_equal_count(sig_valid, n_buckets)
 
         bucket_lbl.loc[t, bucket_ids.index] = bucket_ids
 
@@ -144,23 +162,25 @@ def bucket_backtest(
     bucket_ret = pd.DataFrame(bucket_ret, index=out_dates)
 
     if ffill_labels:
-        bucket_lbl = bucket_lbl.ffill(limit=H-1)
+        bucket_lbl = bucket_lbl.ffill(limit=H - 1)
 
     return bucket_ret, bucket_lbl, ret_fwd
 
 
 def make_tearsheet(
-    md: MarketData,
+    md: "MarketData",
     signal: pd.DataFrame,
     H: int = 5,
     n_buckets: int = 20,
-    entry_mode: EntryMode = "next_close",
+    entry_mode: "EntryMode" = "next_close",
     min_assets_ic: int = 50,
     plot: bool = True,
     rolling_window_obs: Optional[int] = None,
     benchmark_price: Optional[pd.DataFrame | pd.Series] = None,
     benchmark_name: str = "Benchmark",
     universe_eligible: Optional[pd.DataFrame] = None,
+    *,
+    exec_masks: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Dict[str, Any]:
     """
     Standard tear sheet for your bucket backtest framework.
@@ -193,6 +213,7 @@ def make_tearsheet(
         n_buckets=n_buckets,
         entry_mode=entry_mode,
         universe_eligible=universe_eligible,
+        exec_masks=exec_masks,
     )
 
     rebalance_dates = bucket_ret.index
@@ -491,3 +512,108 @@ def _compute_benchmark_ret_fwd(
         out = exit_px / entry_px - 1.0
 
     return out.rename("benchmark_ret_fwd")
+
+
+def _align_bool(mask: pd.DataFrame, like: pd.DataFrame) -> pd.DataFrame:
+    return mask.reindex(index=like.index, columns=like.columns).fillna(False).astype(bool)
+
+
+def _make_close_exec_masks(exec_masks: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    tradeable = exec_masks["tradeable"].astype("boolean")
+    lu = exec_masks["limit_up_locked"].astype("boolean")
+    ld = exec_masks["limit_down_locked"].astype("boolean")
+
+    tradeable_next = tradeable.shift(-1).astype("boolean").fillna(False).to_numpy(dtype=bool)
+    lu_next = lu.shift(-1).astype("boolean").fillna(False).to_numpy(dtype=bool)
+    ld_next = ld.shift(-1).astype("boolean").fillna(False).to_numpy(dtype=bool)
+
+    # return as DataFrames aligned to original index/cols
+    idx, cols = tradeable.index, tradeable.columns
+    return {
+        "can_buy_next_close": pd.DataFrame(tradeable_next & ~lu_next, index=idx, columns=cols),
+        "can_sell_next_close": pd.DataFrame(tradeable_next & ~ld_next, index=idx, columns=cols),
+    }
+
+
+def _bucketize_equal_count(
+    sig_valid: pd.Series,
+    n_buckets: int,
+) -> pd.Series:
+    """
+    Fast equal-count-ish bucketing using NumPy quantiles.
+
+    Returns:
+      bucket_id per asset, integer in [1..n_buckets], where 1 = worst (lowest signal).
+    """
+    x = sig_valid.to_numpy(dtype=float)
+
+    # Quantile edges (n_buckets bins => n_buckets+1 edges)
+    edges = np.quantile(x, np.linspace(0.0, 1.0, n_buckets + 1))
+
+    # Make edges strictly "cover" extremes (avoid edge effects)
+    edges[0] -= 1e-12
+    edges[-1] += 1e-12
+
+    # Bin: 0..n_buckets-1
+    bid0 = np.searchsorted(edges, x, side="right") - 1
+    bid0 = np.clip(bid0, 0, n_buckets - 1)
+
+    return pd.Series(bid0 + 1, index=sig_valid.index, dtype=int)
+
+
+def _execution_feasible_mask_for_bucket(
+    *,
+    entry_mode: "EntryMode",
+    dates: pd.DatetimeIndex,
+    t: pd.Timestamp,
+    H: int,
+    exec_masks: Dict[str, pd.DataFrame],
+    close_em: Optional[Dict[str, pd.DataFrame]],
+) -> pd.Series:
+    """
+    Step 5-lite (factor research): build a per-ticker feasibility mask at formation date t.
+
+    Contract / conventions (non-negotiable):
+    - decision at close[t]
+    - entry occurs on t+1 (open or close depending on entry_mode)
+    - exit occurs on t+H+1 (open or close depending on entry_mode)
+
+    We enforce BOTH:
+      - entry feasibility at t -> t+1 execution time
+      - exit feasibility at (t+H) -> (t+H+1) execution time
+
+    Notes:
+    - For next_open: use can_buy_next_open[t] and can_sell_next_open[t+H]
+    - For next_close: approximate close feasibility using t+1 close lock states
+                     via derived can_buy_next_close[t] and can_sell_next_close[t+H]
+    - For open_to_close: buy at next open, sell at (t+H+1) close (derived next_close sell)
+    """
+    pos_t = dates.get_loc(t)
+    pos_exit_decision = pos_t + H  # decision date for exit when exiting at next_open/next_close
+
+    if pos_exit_decision >= len(dates):
+        return pd.Series(False, index=exec_masks["tradeable"].columns)
+
+    t_exit_decision = dates[pos_exit_decision]
+
+    if entry_mode == "next_open":
+        entry_ok = exec_masks["can_buy_next_open"].loc[t]
+        exit_ok = exec_masks["can_sell_next_open"].loc[t_exit_decision]
+        return (entry_ok & exit_ok).astype(bool)
+
+    if entry_mode == "next_close":
+        if close_em is None:
+            raise ValueError("close_em required for entry_mode='next_close'")
+        entry_ok = close_em["can_buy_next_close"].loc[t]
+        exit_ok = close_em["can_sell_next_close"].loc[t_exit_decision]
+        return (entry_ok & exit_ok).astype(bool)
+
+    if entry_mode == "open_to_close":
+        if close_em is None:
+            raise ValueError("close_em required for entry_mode='open_to_close'")
+        entry_ok = exec_masks["can_buy_next_open"].loc[t]
+        exit_ok = close_em["can_sell_next_close"].loc[t_exit_decision]
+        return (entry_ok & exit_ok).astype(bool)
+
+    raise ValueError("entry_mode must be one of: next_close, next_open, open_to_close")
+

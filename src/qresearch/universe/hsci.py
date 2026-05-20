@@ -12,14 +12,15 @@ def build_hsci_ticker_master(
     *,
     history_code_col: str = "Stock Code 股份代號",
     snapshot_code_col: str = "Stock Code",
+    current_components: pd.DataFrame | None = None,
+    current_code_col: str = "Stock Code",
     save: bool = True,
     out_fname: str = "hsci_ticker_master.csv",
-) -> pd.DataFrame:
+    return_audit: bool = False,
+) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, object]]:
     """
     Build survivorship-safe ticker master:
         tickers_ever = (2008 snapshot tickers) U (all tickers appearing in history events)
-
-    TODO: (2008 snapshot tickers) U (all tickers appearing in history events) U (current hsci components)
 
     Returns a DataFrame with:
         ticker, in_seed_2008, in_history_events
@@ -48,20 +49,44 @@ def build_hsci_ticker_master(
     )
     seed_set = set(seed_tickers)
 
+    current_set: set[str] = set()
+    unresolved_current: list[str] = []
+    if current_components is not None:
+        current_codes = current_components.get(current_code_col)
+        if current_codes is None:
+            raise KeyError(f"Missing column in current_components: {current_code_col}")
+        for raw_code in current_codes.tolist():
+            normalized = canon_hk_ticker(raw_code)
+            if pd.isna(normalized):
+                unresolved_current.append(str(raw_code))
+                continue
+            current_set.add(str(normalized))
+
     # --- union ---
-    master = sorted(seed_set | hist_set)
+    master = sorted(seed_set | hist_set | current_set)
 
     out = pd.DataFrame({
         "ticker": master,
         "in_seed_2008": [t in seed_set for t in master],
         "in_history_events": [t in hist_set for t in master],
+        "in_current_components": [t in current_set for t in master],
     })
 
     if save:
         out_path = get_processed_dir() / out_fname
         out.to_csv(out_path, index=False)
 
-    return out
+    if not return_audit:
+        return out
+
+    audit = {
+        "history_rows": int(len(all_df)),
+        "snapshot_rows": int(len(snapshot_2008)),
+        "current_components_rows": int(len(current_components)) if current_components is not None else 0,
+        "current_components_unresolved": unresolved_current,
+        "master_count": int(len(out)),
+    }
+    return out, audit
 
 
 def load_or_build_hsci_ticker_master(
@@ -82,10 +107,13 @@ def load_or_build_hsci_ticker_master(
 
     all_df = load_hsci_components_history(all_df_fname)
     snap_2008 = load_hsci_2008_components(snapshot_2008_fname)
+    current_components_path = get_processed_dir() / "hsci_components.csv"
+    current_components = pd.read_csv(current_components_path) if current_components_path.exists() else None
 
     return build_hsci_ticker_master(
         all_df,
         snap_2008,
+        current_components=current_components,
         save=True,
         out_fname=out_fname,
     )

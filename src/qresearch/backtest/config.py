@@ -144,6 +144,7 @@ class TradeDrawdownStopOverlay:
         self,
         md,
         w_target: pd.DataFrame,   # decision weights at close[t] (UNSHIFTED)
+        ctx: Dict[str, Any] | None = None,
     ) -> Tuple[pd.DataFrame, dict]:
 
         if not self.cfg.enabled:
@@ -687,4 +688,3 @@ def _rescale_and_cap_leg(w_unit: pd.Series, target_gross: float, w_cap: Optional
         w *= (target_gross / final_sum)
 
     return w
-

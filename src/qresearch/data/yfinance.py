@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Union, List
+from typing import Iterable, Optional, Sequence, Union, List, Literal
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from qresearch.data.types import MarketData
 
 Tickers = Union[str, Sequence[str]]
+FillMethod = Literal["ffill", "none"]
+YAHOO_SOURCE_QUALITY = "exploratory"
 
 
 def download_market_data(
@@ -16,6 +18,7 @@ def download_market_data(
         end: Optional[str] = None,
         *,
         auto_adjust_close: bool = True,
+        fill_method: FillMethod = "ffill",
         ffill: bool = True,
         drop_all_nan_rows: bool = True,
 ) -> MarketData:
@@ -36,8 +39,8 @@ def download_market_data(
             tick_list,
             start=start,
             end=end,
-            auto_adjust=True,
-            ffill=ffill,
+            auto_adjust=auto_adjust_close,
+            fill_method=_normalize_fill_method(fill_method=fill_method, ffill=ffill),
             drop_all_nan_rows=drop_all_nan_rows,
         )
         print(f"[✓] Download complete. Shape: {ohlc.shape}")
@@ -86,6 +89,14 @@ def _as_list(tickers: Tickers) -> list[str]:
     if isinstance(tickers, str):
         return [tickers]
     return list(tickers)
+
+
+def _normalize_fill_method(*, fill_method: FillMethod | None = None, ffill: bool | None = None) -> FillMethod:
+    if fill_method is not None:
+        return fill_method
+    if ffill is None:
+        return "ffill"
+    return "ffill" if ffill else "none"
 
 
 def _standardize_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,6 +161,7 @@ def download_close(
     *,
     auto_adjust: bool = True,
     use_adj_close_if_present: bool = False,
+    fill_method: FillMethod | None = None,
     ffill: bool = True,
     drop_all_nan_rows: bool = True,
 ) -> pd.DataFrame:
@@ -187,7 +199,7 @@ def download_close(
 
     # Basic cleaning
     px = px.replace([np.inf, -np.inf], np.nan)
-    if ffill:
+    if _normalize_fill_method(fill_method=fill_method, ffill=ffill) == "ffill":
         px = px.ffill()
 
     if drop_all_nan_rows:
@@ -205,6 +217,7 @@ def download_ohlc(
     end: Optional[str] = None,
     *,
     auto_adjust: bool = False,
+    fill_method: FillMethod | None = None,
     ffill: bool = True,
     drop_all_nan_rows: bool = True,
 ) -> pd.DataFrame:
@@ -246,7 +259,7 @@ def download_ohlc(
     out = raw.loc[:, (fields_keep, tick_list)].copy()
 
     out = out.replace([np.inf, -np.inf], np.nan)
-    if ffill:
+    if _normalize_fill_method(fill_method=fill_method, ffill=ffill) == "ffill":
         # forward fill within each field/ticker column
         out = out.ffill()
 
