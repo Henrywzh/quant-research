@@ -1,0 +1,3 @@
+issuer_code,pattern,note_group,priority
+*,investment properties,investment_properties,100
+*,deferred tax,deferred_tax,100

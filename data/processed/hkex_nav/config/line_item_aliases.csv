@@ -1,0 +1,3 @@
+issuer_code,pattern,canonical_code,statement_type,scope_hint,priority
+*,equity attributable to owners,equity_attributable_to_owners,balance_sheet,attributable_owners,100
+*,cash and bank balances,cash_and_bank_balances,balance_sheet,group,100

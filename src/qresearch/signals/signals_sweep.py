@@ -19,23 +19,19 @@ class SignalTestConfig:
     entry_mode: EntryMode = "next_close"
     min_assets_ic: int = 50
 
-    # --- Universe gating ---
-    # If True: apply survivorship-safe membership mask (requires events + seed_members)
-    use_hsci_membership: bool = True
-
     # --- Investable filters (applied at formation date t) ---
     # Use None to disable each rule cleanly.
 
     # Price floor
-    ma_window: int = 21
-    min_ma_price: Optional[float] = 1.0
-
-    # Market cap floor (rolling mean)
-    mcap_window: int = 21
-    min_mean_mcap: Optional[float] = 1e9  # e.g. 1e9 / 1e10 enables
-
-    # IPO seasoning (trading days since first valid close)
-    min_ipo_trading_days: Optional[int] = 63  # e.g. 63 enables
+    # ma_window: int = 21
+    # min_ma_price: Optional[float] = 1.0
+    #
+    # # Market cap floor (rolling mean)
+    # mcap_window: int = 21
+    # min_mean_mcap: Optional[float] = 1e9  # e.g. 1e9 / 1e10 enables
+    #
+    # # IPO seasoning (trading days since first valid close)
+    # min_ipo_trading_days: Optional[int] = 63  # e.g. 63 enables
 
 
 def _make_long_short(bucket_ret: pd.DataFrame, worst: str, best: str) -> pd.Series:
@@ -72,10 +68,8 @@ def run_signal_test(
     benchmark_name: str = "Benchmark",
     plot: bool = False,
     *,
-    # NEW: prebuilt universe eligibility (formation-date gate)
     universe_eligible: Optional[pd.DataFrame] = None,
-    # Optional: whether to mask the signal before testing.
-    # Default False (recommended) so coverage diagnostics remain meaningful.
+    exec_masks: Optional[Dict[str, pd.DataFrame]] = None,
     mask_signal: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -118,6 +112,7 @@ def run_signal_test(
         benchmark_price=benchmark_price,
         benchmark_name=benchmark_name,
         universe_eligible=ue,  # critical
+        exec_masks=exec_masks,
     )
 
     # 4) compact summary
@@ -164,6 +159,7 @@ def sweep_signals(
     cfg: SignalTestConfig,
     *,
     universe_eligible: Optional[pd.DataFrame] = None,
+    exec_masks: Optional[Dict[str, pd.DataFrame]] = None,
     benchmark_price: Optional[pd.DataFrame | pd.Series] = None,
     benchmark_name: str = "Benchmark",
     keep_rep: bool = True,
@@ -181,6 +177,7 @@ def sweep_signals(
             benchmark_name=benchmark_name,
             plot=False,
             universe_eligible=universe_eligible,
+            exec_masks=exec_masks,
             mask_signal=False,
         )
 
@@ -224,5 +221,4 @@ def sweep_signals(
 def _signal_key(name: str, params: dict) -> str:
     items = ",".join(f"{k}={params[k]}" for k in sorted(params))
     return f"{name}({items})"
-
 

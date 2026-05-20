@@ -1,0 +1,45 @@
+{
+  "manual_inputs": [
+    {
+      "downstream_datasets": [
+        "hkex_nav_prices_daily",
+        "filings_index"
+      ],
+      "last_updated": "2026-05-20",
+      "name": "issuers.csv",
+      "owner": "research",
+      "source_note": "Maintained issuer universe for the HKEX NAV workflow.",
+      "validation_status": "seeded"
+    },
+    {
+      "downstream_datasets": [
+        "statement_line_items"
+      ],
+      "last_updated": "2026-05-20",
+      "name": "line_item_aliases.csv",
+      "owner": "research",
+      "source_note": "Manual canonical mapping rules for extraction normalization.",
+      "validation_status": "seeded"
+    },
+    {
+      "downstream_datasets": [
+        "investment_property_notes"
+      ],
+      "last_updated": "2026-05-20",
+      "name": "note_heading_aliases.csv",
+      "owner": "research",
+      "source_note": "Manual note-group alias mapping.",
+      "validation_status": "seeded"
+    },
+    {
+      "downstream_datasets": [
+        "rnav_assumptions"
+      ],
+      "last_updated": "2026-05-20",
+      "name": "issuer_overrides.csv",
+      "owner": "research",
+      "source_note": "Explicit issuer-level overrides with audit trail.",
+      "validation_status": "seeded"
+    }
+  ]
+}

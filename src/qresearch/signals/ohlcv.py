@@ -46,10 +46,10 @@ def on_minus_id(md: MarketData, lookback: int = 20, sign: int = -1) -> pd.DataFr
 @register_signal(
     "rsi",
     description="rsi, default lookback: 14",
-    defaults={"lookback": 14},
+    defaults={"lookback": 14 , 'sign': 1},
     requires=("close",),
 )
-def rsi(md: MarketData, lookback: int = 14) -> pd.DataFrame:
+def rsi(md: MarketData, lookback: int = 14, sign: int = 1) -> pd.DataFrame:
     """
     RSI computed per ticker from Close prices.
     Returns RSI in [0, 100]. Higher RSI = stronger recent gains.
@@ -66,7 +66,7 @@ def rsi(md: MarketData, lookback: int = 14) -> pd.DataFrame:
 
     rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+    return sign * rsi
 
 
 @register_signal(
@@ -99,11 +99,11 @@ def trend_annret_r2(md: MarketData, lookback: int = 126, ann_factor: int = 252, 
     return trend_score_annret_r2(md.close, lookback=lookback, ann_factor=ann_factor, skip=skip)
 
 
-@register_signal("mom_ret", description="Return over lookback with optional skip", defaults={"lookback": 21, "skip": 0})
-def mom_ret(md: MarketData, lookback: int = 21, skip: int = 0) -> pd.DataFrame:
+@register_signal("mom_ret", description="Return over lookback with optional skip", defaults={"lookback": 21, "skip": 0, 'sign': 1})
+def mom_ret(md: MarketData, lookback: int = 21, skip: int = 0, sign: int = 1) -> pd.DataFrame:
     p1 = md.close.shift(skip)
     p0 = md.close.shift(skip + lookback)
-    return p1 / p0 - 1.0
+    return sign * (p1 / p0 - 1.0)
 
 
 @register_signal("mom_12_1", description="12-1 momentum (252 lookback, 21 skip)", defaults={"lookback": 252, "skip": 21})
@@ -127,10 +127,10 @@ def ma_diff(md: MarketData, lookback: int, skip: int = 0, sign: int = 1) -> pd.D
 @register_signal(
     "ma_angle",
     description="ma_angle, default lookback: 20",
-    defaults={"lookback": 20, 'skip': 0},
+    defaults={"lookback": 20, 'skip': 0, 'sign': 1},
     requires=("close",),
 )
-def ma_angle(md: MarketData, lookback: int = 20, skip: int = 0) -> pd.DataFrame:
+def ma_angle(md: MarketData, lookback: int = 20, skip: int = 0, sign: int = 1) -> pd.DataFrame:
     """
     Calculates the angle of the Moving Average (SMA) in degrees.
 
@@ -160,7 +160,7 @@ def ma_angle(md: MarketData, lookback: int = 20, skip: int = 0) -> pd.DataFrame:
     angle_rad = np.arctan(slope)
     angle_deg = np.degrees(angle_rad)
 
-    return angle_deg
+    return sign * angle_deg
 
 
 def trend_score_annret_r2(
@@ -395,22 +395,42 @@ def bull_bear_change(md: MarketData, window1: int = 10, window2: int = 30, sign:
 @register_signal(
     "liq_turn_avg_3M",
     description="3M turnover mean: mean(volume/shares_outstanding) over lookback (~63d).",
-    defaults={"lookback": 63, "lot_size": 1, "sign": 1},
-    requires=("volume", "shares_outstanding"),
+    defaults={"lookback": 63, "lot_size": 1, 'use_proxy': True, "sign": 1},
+    # requires=("volume", "shares_outstanding"),
 )
-def liq_turn_avg_3M(md: MarketData, lookback: int = 63, lot_size: int = 1, sign: int = 1) -> pd.DataFrame:
-    turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+def liq_turn_avg_3M(
+        md: MarketData,
+        lookback: int = 63,
+        lot_size: int = 1,
+        use_proxy: bool = True,
+        sign: int = 1
+) -> pd.DataFrame:
+    if hasattr(md, "turnover") and (md.turnover is not None) and (not use_proxy):
+        turn = md.turnover
+    else:
+        turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+
     return sign * turn.rolling(lookback).mean()
 
 
 @register_signal(
     "liq_turn_std_3M",
     description="3M turnover std: std(volume/shares_outstanding) over lookback (~63d).",
-    defaults={"lookback": 63, "lot_size": 1, "sign": 1},
-    requires=("volume", "shares_outstanding"),
+    defaults={"lookback": 63, "lot_size": 1, 'use_proxy': True, "sign": 1},
+    # requires=("volume", "shares_outstanding"),
 )
-def liq_turn_std_3M(md: MarketData, lookback: int = 63, lot_size: int = 1, sign: int = 1) -> pd.DataFrame:
-    turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+def liq_turn_std_3M(
+        md: MarketData,
+        lookback: int = 63,
+        lot_size: int = 1,
+        use_proxy: bool = True,
+        sign: int = 1
+) -> pd.DataFrame:
+    if hasattr(md, "turnover") and (md.turnover is not None) and (not use_proxy):
+        turn = md.turnover
+    else:
+        turn = _turnover_from_volume_and_shares(md, lot_size=lot_size)
+
     return sign * turn.rolling(lookback).std()
 
 

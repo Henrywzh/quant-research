@@ -1,73 +1,129 @@
+# ============================================================
+# qresearch/universe/build.py
+# ============================================================
+
+from __future__ import annotations
+
+from typing import Dict
 import pandas as pd
-from qresearch.universe.filters import UniverseFilterConfig, build_universe_eligible
-from qresearch.universe.hsci import build_hsci_member_mask
+from qresearch.data.types import MarketData
+from qresearch.universe.gating.ashare_connect import AShareConnectMembershipGate
+from qresearch.universe.filters import UniverseFilterConfig, build_universe_eligible, _align_bool
+from qresearch.universe.gating.base import MembershipGate
+
+
+def build_ashare_connect_universe_eligible(
+    *,
+    md: "MarketData",
+    connect_events_df: pd.DataFrame,
+    cfg: "UniverseFilterConfig",
+    mcap: pd.DataFrame | None = None,           # matrix (dates x tickers), optional
+    effective_on_close: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Step 6:
+      - Build membership mask from A股通 events
+      - Build investable mask from cfg (price floor / mcap / ipo seasoning / liquidity)
+      - Combine to final_eligible
+
+    Note:
+      turnover_value uses md.turnover (JQ money mapped to Turnover in MarketData)
+    """
+    gate = AShareConnectMembershipGate(
+        events=connect_events_df,
+        code_col="code",
+        date_col="change_date",
+        dir_col="direction",
+        seed_members=None,
+    )
+
+    bundle = prepare_universe_bundle(
+        close=md.close,
+        gate=gate,
+        cfg=cfg,
+        mcap=mcap,
+        turnover_value=md.turnover,          # used if cfg.min_mean_turnover_value is set
+        effective_on_close=effective_on_close,
+    )
+    return bundle
+
 
 
 def build_final_universe_eligible(
     close: pd.DataFrame,
     *,
-    events: pd.DataFrame | None = None,
-    seed_members: set[str] | None = None,
+    gate: MembershipGate | None,
     cfg: UniverseFilterConfig,
     mcap: pd.DataFrame | None = None,
+    turnover_value: pd.DataFrame | None = None,
+    life_span_df: pd.DataFrame | None = None,
     effective_on_close: bool = True,
 ) -> pd.DataFrame:
     """
-    final_eligible[t,i] = member_gate[t,i] & investable_filters[t,i]
+    final_eligible[t,i] = member_mask[t,i] & exists_mask[t,i] & investable_mask[t,i]
 
-    If events is None:
-      member_gate := True for all tickers/dates (i.e., no membership gating)
+    - gate=None => membership gate is all True (no membership restriction)
+    - exists_mask defaults to close.notna() (proxy for "listed/tradable in dataset")
     """
-    # 1) membership gate
-    if events is None:
-        hsci_member = pd.DataFrame(True, index=close.index, columns=close.columns)
-    else:
-        hsci_member = build_hsci_member_mask(
-            dates=close.index,
-            tickers=close.columns,
-            events=events,
-            seed_members=seed_members,
-            effective_on_close=effective_on_close,
-        )
-        hsci_member = _align_bool(hsci_member, close)
+    dates, tickers = close.index, close.columns
 
-    # 2) investable filters
-    investable = build_universe_eligible(close=close, cfg=cfg, mcap=mcap)
+    exists = close.notna()
+
+    if gate is None:
+        member = pd.DataFrame(True, index=dates, columns=tickers)
+    else:
+        member = gate.build_mask(dates=dates, tickers=tickers, effective_on_close=effective_on_close)
+    member = _align_bool(member, close)
+
+    investable = build_universe_eligible(
+        close=close,
+        cfg=cfg,
+        mcap=mcap,
+        turnover_value=turnover_value,
+        life_span_df=life_span_df
+    )
     investable = _align_bool(investable, close)
 
-    # 3) final
-    return _align_bool(hsci_member & investable, close)
+    return _align_bool(member & exists & investable, close)
 
 
 def prepare_universe_bundle(
     close: pd.DataFrame,
     *,
-    events: pd.DataFrame,
-    seed_members: set[str] | None,
+    gate: MembershipGate | None,
     cfg: UniverseFilterConfig,
     mcap: pd.DataFrame | None = None,
+    turnover_value: pd.DataFrame | None = None,
+    life_span_df: pd.DataFrame | None = None,
+    effective_on_close: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """
     Convenience: return intermediate masks for debugging/plots.
     """
-    hsci_member = build_hsci_member_mask(
-        dates=close.index,
-        tickers=close.columns,
-        events=events,
-        seed_members=seed_members,
-        effective_on_close=True,
-    )
-    investable = build_universe_eligible(close=close, cfg=cfg, mcap=mcap)
+    dates, tickers = close.index, close.columns
+    exists = close.notna()
+
+    if gate is None:
+        member = pd.DataFrame(True, index=dates, columns=tickers)
+    else:
+        member = gate.build_mask(dates=dates, tickers=tickers, effective_on_close=effective_on_close)
+    member = _align_bool(member, close)
+
+    # --- FIX: No membership history before first event date ---
+    if gate is not None and hasattr(gate, "events"):
+        # assumes gate.events is the same dataframe you passed in
+        d0 = pd.to_datetime(gate.events[cfg.date_col if hasattr(cfg, "date_col") else "change_date"]).min()
+        member.loc[member.index < d0, :] = False
+
+
+    investable = build_universe_eligible(close=close, cfg=cfg, mcap=mcap, turnover_value=turnover_value, life_span_df=life_span_df)
     investable = _align_bool(investable, close)
-    hsci_member = _align_bool(hsci_member, close)
+
+    final_eligible = _align_bool(member & exists & investable, close)
 
     return {
-        "hsci_member": hsci_member,
+        "member": member,
+        "exists": exists.reindex_like(close).fillna(False).astype(bool),
         "investable": investable,
-        "final_eligible": hsci_member & hsci_member,
+        "final_eligible": final_eligible,
     }
-
-
-def _align_bool(mask: pd.DataFrame, like: pd.DataFrame) -> pd.DataFrame:
-    """Reindex mask to match `like` and fill missing with False."""
-    return mask.reindex(index=like.index, columns=like.columns).fillna(False).astype(bool)
