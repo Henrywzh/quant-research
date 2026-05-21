@@ -20,6 +20,8 @@ Agents should orient in this order before proposing changes or new research:
 3. relevant `memory/strategies/<strategy>/strategy.md`
 4. relevant expectation and evaluation files
 5. supporting source notes or notebooks only after the canonical files above
+6. relevant discretionary files when the prompt is about manual trades, trade
+   review, or systematization
 
 ## File Classes And Write Rules
 
@@ -41,11 +43,15 @@ Agents should orient in this order before proposing changes or new research:
 - `memory/knowledge/*.md`
 - `memory/heuristics/*.md`
 - `memory/decisions/*.md`
+- `discretionary/playbooks/*.md`
+- `discretionary/systematization/*.md`
 
 Rules:
 - Agents may append to append-only files, but must not rewrite prior entries.
 - Automations may write only to designated observation and evaluation files.
 - Automations must queue durable-memory promotions in `workspace/inbox.md`.
+- Discretionary trade files and systematic strategy files must remain distinct
+  until an idea passes through explicit systematization.
 - No agent may change canonical headings or schemas without updating this file.
 
 ## Canonical Schemas
@@ -94,6 +100,49 @@ Every evaluation entry must include:
 - `What Was Wrong`
 - `Next Adjustment`
 
+### Discretionary Idea Entries
+
+Every discretionary idea entry must include:
+
+- `Idea ID`
+- `Status`
+- `Source`
+- `Asset`
+- `Direction`
+- `Time Horizon`
+- `Theme`
+- `Thesis`
+- `Why Now`
+- `Entry Trigger`
+- `Invalidation`
+- `Risk`
+- `What Would Prove This Wrong`
+- `Can This Be Systematized?`
+- `Candidate Quant Proxies`
+
+### Discretionary Trade Entries
+
+Every discretionary trade entry must include:
+
+- `Trade ID`
+- `Linked Idea`
+- `Status`
+- `Asset`
+- `Direction`
+- `Entry Date`
+- `Entry Price`
+- `Size`
+- `Stop`
+- `Target`
+- `Max Risk Budget`
+- `Original Plan`
+- `Updates`
+- `Exit`
+- `PnL`
+- `Decision Quality Review`
+- `Outcome Review`
+- `Systematization Note`
+
 ## Standard Operating Procedure
 
 ### Manual Research Logging
@@ -113,6 +162,30 @@ Every evaluation entry must include:
 5. Add durable-memory suggestions to `workspace/inbox.md`, never silently
    rewrite findings or decisions.
 
+### Discretionary Workflow
+
+1. Log manual ideas in `discretionary/ideas/open_ideas.md`.
+2. Record executed discretionary trades in `discretionary/trades/open_trades.md`.
+3. Move closed trades to `discretionary/trades/closed_trades.md`.
+4. Review process quality in `discretionary/trades/postmortems.md`.
+5. Promote repeatable discretionary patterns into
+   `discretionary/systematization/candidates.md`.
+6. Only promote a discretionary setup into `memory/strategies/...` after it has
+   a testable rule definition and explicit systematization record.
+
+## Optional Mode Overrides
+
+- Agents should infer the working mode from the user prompt by default.
+- Users may optionally prefix prompts with:
+  - `Mode: manual idea`
+  - `Mode: trade review`
+  - `Mode: systematize`
+  - `Mode: systematic`
+- [workspace/mode.md](workspace/mode.md) is an optional override and strong
+  hint when it has been updated recently.
+- If a prompt mixes discretionary trade discussion and coding, the default is
+  `discuss first`, then propose a short systematization path only if useful.
+
 ## Source Policy
 
 - Local repo artifacts are the first source for strategy-specific context.
@@ -126,6 +199,9 @@ Every evaluation entry must include:
 
 - [workspace/current_focus.md](workspace/current_focus.md)
 - [workspace/session_handoff.md](workspace/session_handoff.md)
+- [workspace/mode.md](workspace/mode.md)
 - [memory/research_log.md](memory/research_log.md)
 - [memory/strategies/smh_regime_filter/strategy.md](memory/strategies/smh_regime_filter/strategy.md)
+- [agent_response_contract.md](agent_response_contract.md)
+- [discretionary/manifest.md](discretionary/manifest.md)
 - [automations/automation_manifest.md](automations/automation_manifest.md)

@@ -12,7 +12,9 @@ REQUIRED_FILES = [
     "workspace/current_focus.md",
     "workspace/active_projects.md",
     "workspace/session_handoff.md",
+    "workspace/mode.md",
     "workspace/inbox.md",
+    "agent_response_contract.md",
     "memory/research_log.md",
     "memory/strategies/smh_regime_filter/strategy.md",
     "memory/strategies/smh_regime_filter/experiments.md",
@@ -25,6 +27,18 @@ REQUIRED_FILES = [
     "memory/knowledge/sector_relative_performance.md",
     "memory/knowledge/hard_assets_and_bitcoin.md",
     "memory/knowledge/sovereign_duration_tracks.md",
+    "discretionary/manifest.md",
+    "discretionary/ideas/open_ideas.md",
+    "discretionary/ideas/archived_ideas.md",
+    "discretionary/trades/open_trades.md",
+    "discretionary/trades/closed_trades.md",
+    "discretionary/trades/postmortems.md",
+    "discretionary/playbooks/setup_types.md",
+    "discretionary/playbooks/risk_framework.md",
+    "discretionary/playbooks/invalidation_rules.md",
+    "discretionary/systematization/candidates.md",
+    "discretionary/systematization/rejected.md",
+    "discretionary/systematization/promoted_to_systematic.md",
     "expectations/strategy_expectations/smh_regime_filter.md",
     "expectations/market_views/daily_expectations.md",
     "expectations/market_views/weekly_expectations.md",
@@ -173,3 +187,96 @@ def test_canonical_yfinance_watchlist_file_exists_and_is_referenced():
     ]:
         text = _read(rel_path)
         assert "yfinance_watchlists.md" in text
+
+
+def test_agent_response_contract_documents_modes_and_discuss_first_default():
+    text = _read("agent_response_contract.md")
+    for mode in [
+        "`systematic_research`",
+        "`manual_trade_discussion`",
+        "`trade_review`",
+        "`systematization`",
+    ]:
+        assert mode in text
+    assert "discuss first" in text
+    assert "ask one short clarification question" in text
+
+
+def test_optional_mode_override_file_documents_override_behavior():
+    text = _read("workspace/mode.md")
+    assert "Agents should infer the working mode from the current" in text
+    assert "strong override hint" in text
+    for cue in [
+        "`Mode: manual idea`",
+        "`Mode: trade review`",
+        "`Mode: systematize`",
+        "`Mode: systematic`",
+    ]:
+        assert cue in text
+
+
+def test_discretionary_templates_cover_idea_trade_and_postmortem_fields():
+    idea = _read("discretionary/ideas/open_ideas.md")
+    for required in [
+        "- Idea ID:",
+        "- Status:",
+        "- Source:",
+        "- Asset:",
+        "- Direction:",
+        "- Time Horizon:",
+        "- Theme:",
+        "### Thesis",
+        "### Why Now",
+        "### Entry Trigger",
+        "### Invalidation",
+        "### Risk",
+        "### What Would Prove This Wrong",
+        "### Can This Be Systematized?",
+        "### Candidate Quant Proxies",
+    ]:
+        assert required in idea
+
+    trade = _read("discretionary/trades/open_trades.md")
+    for required in [
+        "- Trade ID:",
+        "- Linked Idea:",
+        "- Status:",
+        "- Asset:",
+        "- Direction:",
+        "- Entry Date:",
+        "- Entry Price:",
+        "- Size:",
+        "- Stop:",
+        "- Target:",
+        "- Max Risk Budget:",
+        "### Original Plan",
+        "### Updates",
+        "### Exit",
+        "### PnL",
+        "### Decision Quality Review",
+        "### Outcome Review",
+        "### Systematization Note",
+    ]:
+        assert required in trade
+
+    postmortem = _read("discretionary/trades/postmortems.md")
+    for required in [
+        "- Trade Ref:",
+        "### Was The Thesis Good?",
+        "### Was The Risk Good?",
+        "### Was The Execution Good?",
+        "### Was The Discipline Good?",
+        "### Outcome Quality",
+        "### Repeatable?",
+        "### Should This Be Systematized?",
+        "### Next Adjustment",
+    ]:
+        assert required in postmortem
+
+
+def test_systematization_candidates_keep_discretionary_origin_separate():
+    text = _read("discretionary/systematization/candidates.md")
+    assert "- Origin: `discretionary`" in text
+    assert "- Linked Idea:" in text
+    assert "- Linked Trade Ref:" in text
+    assert "validated systematic strategy" in text

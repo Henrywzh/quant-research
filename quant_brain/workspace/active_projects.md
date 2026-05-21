@@ -27,6 +27,24 @@
   - [../evaluations/prediction_scoreboard.md](../evaluations/prediction_scoreboard.md)
   - [inbox.md](inbox.md)
 
+## Discretionary Trade Journal
+
+- Status: `active`
+- Goal: support manual trade ideas, execution logs, and post-trade quality review
+- Primary Files:
+  - [../discretionary/manifest.md](../discretionary/manifest.md)
+  - [../discretionary/ideas/open_ideas.md](../discretionary/ideas/open_ideas.md)
+  - [../discretionary/trades/postmortems.md](../discretionary/trades/postmortems.md)
+
+## Discretionary To Systematic Bridge
+
+- Status: `active`
+- Goal: turn repeatable discretionary patterns into explicit quantitative candidates
+- Primary Files:
+  - [../discretionary/systematization/candidates.md](../discretionary/systematization/candidates.md)
+  - [../agent_response_contract.md](../agent_response_contract.md)
+  - [../workspace/mode.md](../workspace/mode.md)
+
 ## Large Vs Small Caps
 
 - Status: `active`
